@@ -342,13 +342,22 @@ static void do_tx(const tx_request_t *req)
 
 static void do_rx_packet(void)
 {
-    /* Where in the FIFO did the radio land the new packet, and how big? */
+    /* Freeze the FIFO during read-out: STDBY_RC pauses the receiver so a
+     * back-to-back RX can't overwrite the bytes we're about to read. The
+     * 256-byte data buffer is preserved across STDBY (DS §6.1). The cost
+     * is missing any packet whose preamble starts during this ~100 µs
+     * window; for beacon-rate traffic that is effectively zero. */
+    set_standby(SX_STANDBY_RC);
+
     uint8_t st[2] = {0};
     sx1262_hal_cmd_read(SX_CMD_GET_RX_BUFFER_STATUS, NULL, 0, st, 2);
     uint8_t payload_len = st[0];
     uint8_t buf_start   = st[1];
 
-    if (payload_len == 0 || payload_len > MAX_LORA_PAYLOAD) return;
+    if (payload_len == 0) {
+        enter_rx_continuous();
+        return;
+    }
 
     static uint8_t rxbuf[MAX_LORA_PAYLOAD];
     sx1262_hal_read_buf(buf_start, rxbuf, payload_len);
@@ -360,6 +369,9 @@ static void do_rx_packet(void)
     sx1262_hal_cmd_read(SX_CMD_GET_PACKET_STATUS, NULL, 0, ps, 3);
     int8_t rssi = -(int8_t)(ps[0] / 2);
     int8_t snr  =  (int8_t)ps[1] / 4;
+
+    /* Resume continuous RX before the callback runs. */
+    enter_rx_continuous();
 
     if (s_cfg.rx_callback) {
         s_cfg.rx_callback(rxbuf, payload_len, rssi, snr);
@@ -393,11 +405,12 @@ void sx1262_run(void)
 
             if (irq & SX_IRQ_RX_DONE) {
                 if (irq & SX_IRQ_CRC_ERR) {
+                    /* Continuous-mode auto-rearm covers the drop. */
                     ESP_LOGW(TAG, "RX CRC error — packet dropped");
                 } else {
+                    /* do_rx_packet handles the STDBY/RX flip itself. */
                     do_rx_packet();
                 }
-                /* In continuous mode the chip auto-rearms; nothing else to do. */
             } else if (irq & SX_IRQ_TIMEOUT) {
                 /* Shouldn't happen with timeout=0xFFFFFF, but rearm just in case. */
                 enter_rx_continuous();
