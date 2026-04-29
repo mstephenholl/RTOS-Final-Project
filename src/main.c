@@ -80,6 +80,15 @@ static void init_node_id(void)
     ESP_LOGI(TAG, "node ID: 0x%02X", s_node_id);
 }
 
+static void on_tx_complete(sx1262_status_t status, size_t len)
+{
+    if (status == SX1262_OK) {
+        ESP_LOGI(TAG, "TX completed on air (%u B)", (unsigned)len);
+    } else {
+        ESP_LOGW(TAG, "TX air-side failure (status %d, %u B)", status, (unsigned)len);
+    }
+}
+
 static void on_rx_packet(const uint8_t *data, size_t len, int8_t rssi, int8_t snr)
 {
     s_rx_count++;
@@ -132,6 +141,7 @@ static void lora_task(void *arg)
 
     sx1262_config_t cfg = sx1262_default_config();
     cfg.rx_callback = on_rx_packet;
+    cfg.tx_callback = on_tx_complete;
 
     if (sx1262_init(&cfg) != SX1262_OK) {
         ESP_LOGE(TAG, "sx1262_init failed — radio will not run");

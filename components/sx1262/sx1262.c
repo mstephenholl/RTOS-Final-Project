@@ -53,6 +53,7 @@ sx1262_config_t sx1262_default_config(void)
         .crc_on           = true,
         .iq_inverted      = false,
         .rx_callback      = NULL,
+        .tx_callback      = NULL,
     };
     return c;
 }
@@ -417,10 +418,15 @@ static void do_tx(const tx_request_t *req)
     get_irq_status(&irq);
     clear_irq_status(SX_IRQ_ALL);
 
-    if (irq & SX_IRQ_TX_DONE) {
+    sx1262_status_t status = (irq & SX_IRQ_TX_DONE) ? SX1262_OK : SX1262_ERR_HW;
+    if (status == SX1262_OK) {
         ESP_LOGI(TAG, "TX done (%u B)", req->len);
     } else {
         ESP_LOGW(TAG, "TX irq=0x%04x (no TX_DONE bit)", irq);
+    }
+
+    if (s_cfg.tx_callback) {
+        s_cfg.tx_callback(status, req->len);
     }
 }
 

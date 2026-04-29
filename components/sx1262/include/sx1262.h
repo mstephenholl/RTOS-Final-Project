@@ -24,6 +24,11 @@ typedef enum {
 typedef void (*sx1262_rx_cb_t)(const uint8_t *data, size_t len,
                                int8_t rssi_dbm, int8_t snr_db);
 
+/* Called from the LoRa task once a queued TX has actually been sent
+ * (or has timed out / errored). Status is SX1262_OK on TX_DONE,
+ * SX1262_ERR_HW otherwise. `len` is the frame length that was attempted. */
+typedef void (*sx1262_tx_cb_t)(sx1262_status_t status, size_t len);
+
 typedef struct {
     uint32_t        rf_freq_hz;        /* e.g. 915000000 (US), 868000000 (EU) */
     int8_t          tx_power_dbm;      /* -9 .. +22 (HP PA) */
@@ -35,6 +40,7 @@ typedef struct {
     bool            crc_on;
     bool            iq_inverted;
     sx1262_rx_cb_t  rx_callback;
+    sx1262_tx_cb_t  tx_callback;
 } sx1262_config_t;
 
 sx1262_config_t sx1262_default_config(void);
