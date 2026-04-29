@@ -9,13 +9,18 @@
  *                                posts it to s_rx_events. No I²C in the
  *                                radio hot path.
  *
+ * Frame format (over-the-air):
+ *   [src_id : u8][seq : u8][body bytes ...]
+ * src_id is derived from the LSB of the factory MAC, so two boards flashed
+ * with the same firmware auto-differentiate.
+ *
  * Display layout (text grid, 21 cols × 8 rows, rendered with 5x7 font):
  *
  *   Row 0:  LORA 915 MHZ           <- band header
  *   Row 1:  SF7 BW125 CR4/5        <- modulation summary
  *   Row 2:  ----                   <- separator
- *   Row 3:  TX: NNNN               <- send counter
- *   Row 4:  (blank)
+ *   Row 3:  TX: NNNN  ID:XX        <- send counter and our node ID
+ *   Row 4:  from #YY seq Q         <- last RX sender + sequence number
  *   Row 5:  RX: MMMM               <- receive counter
  *   Row 6:  <last RX payload>      <- truncated to 21 chars
  *   Row 7:  RSSI -dd  SNR sdd      <- last RX link metrics
@@ -28,17 +33,22 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 
 #include "sx1262.h"
 #include "ssd1306.h"
 
 static const char *TAG = "app";
 
-/* Snapshot of one received LoRa packet, handed from lora_task -> app_task
- * so the radio task never blocks on I²C. */
+#define FRAME_HEADER_LEN 2
+
+/* Snapshot of one received LoRa packet (post-header parse), handed from
+ * lora_task -> app_task so the radio task never blocks on I²C. */
 typedef struct {
-    uint8_t  data[255];      /* SX1262 max LoRa payload */
-    uint8_t  len;
+    uint8_t  data[253];      /* SX1262 max payload (255) minus header */
+    uint8_t  len;            /* body length, post-header */
+    uint8_t  src_id;
+    uint8_t  seq;
     int8_t   rssi;
     int8_t   snr;
     uint32_t count;          /* 1-based RX index assigned at reception time */
@@ -50,20 +60,54 @@ static QueueHandle_t s_rx_events;
 /* Single-producer (lora_task via on_rx_packet) — no atomic needed. */
 static uint32_t s_rx_count = 0;
 
+/* Identity & TX sequencing — only touched by app_task. */
+static uint8_t s_node_id = 0;
+static uint8_t s_tx_seq  = 0;
+
+static void init_node_id(void)
+{
+    /* MAC LSB: stable per board, distinct between boards. Lets us flash
+     * one firmware to N boards and have them auto-differentiate. */
+    uint8_t mac[6] = {0};
+    esp_err_t err = esp_read_mac(mac, ESP_MAC_BASE);
+    if (err == ESP_OK) {
+        s_node_id = mac[5];
+    } else {
+        s_node_id = 0xA1;
+        ESP_LOGW(TAG, "esp_read_mac failed (%s); fallback ID 0x%02X",
+                 esp_err_to_name(err), s_node_id);
+    }
+    ESP_LOGI(TAG, "node ID: 0x%02X", s_node_id);
+}
+
 static void on_rx_packet(const uint8_t *data, size_t len, int8_t rssi, int8_t snr)
 {
     s_rx_count++;
 
-    ESP_LOGI(TAG, "RX %u B  rssi=%d dBm  snr=%d dB  : %.*s",
-             (unsigned)len, rssi, snr, (int)len, (const char *)data);
+    if (len < FRAME_HEADER_LEN) {
+        ESP_LOGW(TAG, "RX %u B  rssi=%d  snr=%d  (no frame header — dropped)",
+                 (unsigned)len, rssi, snr);
+        return;
+    }
+
+    uint8_t src_id = data[0];
+    uint8_t seq    = data[1];
+    const uint8_t *body = &data[FRAME_HEADER_LEN];
+    size_t body_len = len - FRAME_HEADER_LEN;
+
+    ESP_LOGI(TAG, "RX from #%02X seq %u  %u B  rssi=%d  snr=%d  : %.*s",
+             src_id, seq, (unsigned)body_len, rssi, snr,
+             (int)body_len, (const char *)body);
 
     rx_event_t evt = {
-        .len   = (uint8_t)len,
-        .rssi  = rssi,
-        .snr   = snr,
-        .count = s_rx_count,
+        .len    = (uint8_t)body_len,
+        .src_id = src_id,
+        .seq    = seq,
+        .rssi   = rssi,
+        .snr    = snr,
+        .count  = s_rx_count,
     };
-    memcpy(evt.data, data, len);
+    if (body_len > 0) memcpy(evt.data, body, body_len);
 
     /* Drop on full: a missed display update is preferable to back-pressuring
      * the radio task into an I²C-paced wait. */
@@ -75,6 +119,7 @@ static void on_rx_packet(const uint8_t *data, size_t len, int8_t rssi, int8_t sn
 
 static void render_rx_event(const rx_event_t *evt)
 {
+    ssd1306_printf(0, 4, "from #%02X seq %u", evt->src_id, evt->seq);
     ssd1306_printf(0, 5, "RX: %04lu", (unsigned long)evt->count);
     ssd1306_printf(0, 6, "%.*s", (int)evt->len, (const char *)evt->data);
     ssd1306_printf(0, 7, "RSSI %d  SNR %+d", evt->rssi, evt->snr);
@@ -107,7 +152,7 @@ static void app_task(void *arg)
         ssd1306_print(0, 0, "LORA 915 MHZ");
         ssd1306_print(0, 1, "SF7 BW125 CR4/5");
         ssd1306_print(0, 2, "---------------------");
-        ssd1306_printf(0, 3, "TX: 0000");
+        ssd1306_printf(0, 3, "TX: 0000  ID:%02X", s_node_id);
         ssd1306_printf(0, 5, "RX: 0000");
         ssd1306_print(0, 6, "(no rx yet)");
         ssd1306_flush();
@@ -117,7 +162,8 @@ static void app_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(500));
 
     uint32_t n = 0;
-    char     payload[40];
+    char     text[40];
+    uint8_t  frame[FRAME_HEADER_LEN + sizeof(text)];
 
     /* TX every TX_INTERVAL; service RX events in between via a
      * deadline-bounded queue wait. */
@@ -128,14 +174,22 @@ static void app_task(void *arg)
         TickType_t now = xTaskGetTickCount();
 
         if ((int32_t)(next_tx - now) <= 0) {
-            int len = snprintf(payload, sizeof(payload),
-                               "hello from heltec v3 #%lu", (unsigned long)n);
+            int text_len = snprintf(text, sizeof(text),
+                                    "hello from heltec v3 #%lu", (unsigned long)n);
+            if (text_len < 0) text_len = 0;
 
-            sx1262_status_t s = sx1262_send((const uint8_t *)payload,
-                                            (size_t)len, pdMS_TO_TICKS(2000));
+            frame[0] = s_node_id;
+            frame[1] = s_tx_seq;
+            memcpy(&frame[FRAME_HEADER_LEN], text, (size_t)text_len);
+            size_t frame_len = FRAME_HEADER_LEN + (size_t)text_len;
+
+            sx1262_status_t s = sx1262_send(frame, frame_len, pdMS_TO_TICKS(2000));
             if (s == SX1262_OK) {
-                ESP_LOGI(TAG, "TX queued: \"%s\"", payload);
-                ssd1306_printf(0, 3, "TX: %04lu", (unsigned long)(n + 1));
+                ESP_LOGI(TAG, "TX queued: src=%02X seq=%u \"%s\"",
+                         s_node_id, s_tx_seq, text);
+                s_tx_seq++;
+                ssd1306_printf(0, 3, "TX: %04lu  ID:%02X",
+                               (unsigned long)(n + 1), s_node_id);
                 ssd1306_flush();
             } else {
                 ESP_LOGW(TAG, "TX enqueue failed (status %d)", s);
@@ -155,6 +209,8 @@ static void app_task(void *arg)
 
 void app_main(void)
 {
+    init_node_id();
+
     s_rx_events = xQueueCreate(RX_EVENT_QUEUE_DEPTH, sizeof(rx_event_t));
     configASSERT(s_rx_events != NULL);
 
