@@ -41,6 +41,11 @@ typedef struct {
     bool            iq_inverted;
     sx1262_rx_cb_t  rx_callback;
     sx1262_tx_cb_t  tx_callback;
+    bool            low_power;         /* true: chip sleeps between TX events
+                                        *  (Class-A-style); false: continuous
+                                        *  RX (default). */
+    uint32_t        rx_window_ms;      /* in low_power mode, post-TX RX
+                                        *  duration before re-entering sleep. */
 } sx1262_config_t;
 
 sx1262_config_t sx1262_default_config(void);

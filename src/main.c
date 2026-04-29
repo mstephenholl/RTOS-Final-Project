@@ -70,6 +70,46 @@
 
 static const char *TAG = "app";
 
+/* ---------------- Role ---------------- */
+
+/* Each board takes one of three roles. Set via -DAPP_ROLE=APP_ROLE_LEAF
+ * (or _ROUTER / _GATEWAY) in build_flags, or override the #define below
+ * per-board before flashing.
+ *
+ *   LEAF    : battery-style. Chip sleeps between TX events; opens a brief
+ *             post-TX RX window for ACKs. Originates traffic. Does NOT
+ *             forward — a sleeping node can't reliably relay.
+ *   ROUTER  : always-on relay. Continuous RX, originates broadcasts +
+ *             unicasts, forwards mesh traffic. The default.
+ *   GATEWAY : always-on observer. Continuous RX, forwards, but never
+ *             originates broadcasts/unicasts. Useful as a passive logger
+ *             that doesn't pollute the network with its own traffic.
+ *             (It still emits ACKs for unicasts addressed to it.) */
+typedef enum {
+    APP_ROLE_LEAF    = 0,
+    APP_ROLE_ROUTER  = 1,
+    APP_ROLE_GATEWAY = 2,
+} app_role_t;
+
+#ifndef APP_ROLE
+#define APP_ROLE APP_ROLE_ROUTER
+#endif
+
+/* Compile-time policy bits — folded out of the binary for unused branches. */
+#define ROLE_LOW_POWER    (APP_ROLE == APP_ROLE_LEAF)
+#define ROLE_FORWARDS     (APP_ROLE != APP_ROLE_LEAF)
+#define ROLE_ORIGINATES   (APP_ROLE != APP_ROLE_GATEWAY)
+
+static const char *role_name(void)
+{
+    switch (APP_ROLE) {
+        case APP_ROLE_LEAF:    return "LEAF";
+        case APP_ROLE_ROUTER:  return "ROUTER";
+        case APP_ROLE_GATEWAY: return "GATEWAY";
+        default:               return "?";
+    }
+}
+
 /* ---------------- Frame format ---------------- */
 
 #define FRAME_HEADER_LEN          4
@@ -481,9 +521,11 @@ static void handle_rx_event(const rx_event_t *evt)
     bool for_us = (evt->dst_id == s_node_id) || (evt->dst_id == MESH_BROADCAST);
     if (for_us && !is_ack) render_rx_event(evt);
 
-    /* (5) Forwarding for anything not solely addressed to us. */
+    /* (5) Forwarding for anything not solely addressed to us. LEAF role
+     *     never forwards — sleeping nodes can't reliably relay, and the
+     *     compile-time constant lets the compiler elide this branch. */
     bool should_forward = (evt->dst_id != s_node_id);
-    if (should_forward && ttl > 0) forward_schedule(evt);
+    if (ROLE_FORWARDS && should_forward && ttl > 0) forward_schedule(evt);
 }
 
 /* ---------------- Tasks ---------------- */
@@ -495,6 +537,7 @@ static void lora_task(void *arg)
     sx1262_config_t cfg = sx1262_default_config();
     cfg.rx_callback = on_rx_packet;
     cfg.tx_callback = on_tx_complete;
+    cfg.low_power   = ROLE_LOW_POWER;
 
     if (sx1262_init(&cfg) != SX1262_OK) {
         ESP_LOGE(TAG, "sx1262_init failed — radio will not run");
@@ -516,6 +559,7 @@ static void app_task(void *arg)
         ssd1306_print(0, 1, "SF7 BW125 CR4/5");
         ssd1306_print(0, 2, "---------------------");
         ssd1306_printf(0, 3, "TX: 0000  ID:%02X", s_node_id);
+        ssd1306_printf(0, 4, "ROLE: %s", role_name());
         ssd1306_printf(0, 5, "RX: 0000");
         ssd1306_print(0, 6, "(no rx yet)");
         ssd1306_flush();
@@ -575,8 +619,8 @@ static void app_task(void *arg)
             continue;
         }
 
-        /* 3. Periodic broadcast. */
-        if ((int32_t)(next_tx - now) <= 0) {
+        /* 3. Periodic broadcast (skipped if our role doesn't originate). */
+        if (ROLE_ORIGINATES && (int32_t)(next_tx - now) <= 0) {
             int text_len = snprintf(text, sizeof(text),
                                     "hello from heltec v3 #%lu", (unsigned long)n);
             if (text_len < 0) text_len = 0;
@@ -606,8 +650,9 @@ static void app_task(void *arg)
             continue;
         }
 
-        /* 4. Periodic unicast w/ wants_ack — only if we've heard a peer. */
-        if ((int32_t)(next_unicast - now) <= 0) {
+        /* 4. Periodic unicast w/ wants_ack — only if originating and we've
+         *    heard a peer. */
+        if (ROLE_ORIGINATES && (int32_t)(next_unicast - now) <= 0) {
             if (s_last_seen_id != 0) {
                 int text_len = snprintf(text, sizeof(text),
                                         "ping #%lu to %02X",
@@ -641,9 +686,14 @@ static void app_task(void *arg)
         }
 
         /* 5. Wait until the soonest deadline (TX, unicast, forward, or ACK
-         *    retry), or until an RX event arrives. */
-        TickType_t deadline = next_tx;
-        if ((int32_t)(next_unicast - deadline) < 0) deadline = next_unicast;
+         *    retry), or until an RX event arrives. For non-originating roles
+         *    (GATEWAY), origination deadlines are skipped; we use a 60 s
+         *    fallback so the loop wakes occasionally even without traffic. */
+        TickType_t deadline = now + pdMS_TO_TICKS(60000);
+        if (ROLE_ORIGINATES) {
+            if ((int32_t)(next_tx - deadline) < 0) deadline = next_tx;
+            if ((int32_t)(next_unicast - deadline) < 0) deadline = next_unicast;
+        }
         deadline = forward_next_deadline(deadline);
         deadline = ack_next_deadline(deadline);
         TickType_t wait = (int32_t)(deadline - now) > 0 ? (deadline - now) : 0;
@@ -658,6 +708,8 @@ static void app_task(void *arg)
 void app_main(void)
 {
     init_node_id();
+    ESP_LOGI(TAG, "role: %s (low_power=%d, forwards=%d, originates=%d)",
+             role_name(), ROLE_LOW_POWER, ROLE_FORWARDS, ROLE_ORIGINATES);
 
     s_rx_events = xQueueCreate(RX_EVENT_QUEUE_DEPTH, sizeof(rx_event_t));
     configASSERT(s_rx_events != NULL);

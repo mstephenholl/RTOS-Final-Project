@@ -54,6 +54,8 @@ sx1262_config_t sx1262_default_config(void)
         .iq_inverted      = false,
         .rx_callback      = NULL,
         .tx_callback      = NULL,
+        .low_power        = false,
+        .rx_window_ms     = 2000,
     };
     return c;
 }
@@ -484,18 +486,39 @@ static void do_rx_packet(void)
     }
 }
 
-void sx1262_run(void)
+/* Open a bounded RX window. Returns when window_ms has elapsed since entry,
+ * draining any RX_DONE events as they arrive. Used in low_power mode after
+ * a TX to catch ACKs / responses before re-entering sleep. */
+static void run_rx_window(uint32_t window_ms)
 {
-    /* Start in continuous RX so we can hear traffic when idle. */
-    set_packet_params(s_cfg.preamble_symbols, MAX_LORA_PAYLOAD,
-                      s_cfg.crc_on, s_cfg.iq_inverted);
     clear_irq_status(SX_IRQ_ALL);
+    enter_rx_continuous();
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(window_ms);
+    while ((int32_t)(deadline - xTaskGetTickCount()) > 0) {
+        TickType_t remaining = deadline - xTaskGetTickCount();
+        if (!sx1262_hal_wait_dio1(remaining)) break;
+
+        uint16_t irq = 0;
+        get_irq_status(&irq);
+        clear_irq_status(SX_IRQ_ALL);
+
+        if (irq & SX_IRQ_RX_DONE) {
+            if (irq & SX_IRQ_CRC_ERR) {
+                ESP_LOGW(TAG, "RX CRC error in window — packet dropped");
+            } else {
+                do_rx_packet();
+            }
+        }
+    }
+}
+
+static void run_continuous_loop(void)
+{
     enter_rx_continuous();
 
     for (;;) {
         tx_request_t req;
 
-        /* Prefer outbound traffic: drain a TX request if one is pending. */
         if (xQueueReceive(s_tx_queue, &req, pdMS_TO_TICKS(100)) == pdTRUE) {
             do_tx(&req);
             clear_irq_status(SX_IRQ_ALL);
@@ -503,7 +526,6 @@ void sx1262_run(void)
             continue;
         }
 
-        /* No TX queued: poll DIO1 briefly for an inbound packet. */
         if (sx1262_hal_wait_dio1(pdMS_TO_TICKS(50))) {
             uint16_t irq = 0;
             get_irq_status(&irq);
@@ -511,10 +533,8 @@ void sx1262_run(void)
 
             if (irq & SX_IRQ_RX_DONE) {
                 if (irq & SX_IRQ_CRC_ERR) {
-                    /* Continuous-mode auto-rearm covers the drop. */
                     ESP_LOGW(TAG, "RX CRC error — packet dropped");
                 } else {
-                    /* do_rx_packet handles the STDBY/RX flip itself. */
                     do_rx_packet();
                 }
             } else if (irq & SX_IRQ_TIMEOUT) {
@@ -522,5 +542,44 @@ void sx1262_run(void)
                 enter_rx_continuous();
             }
         }
+    }
+}
+
+/* Class-A-style loop: chip sleeps until the application enqueues a TX. We
+ * wake, transmit, open a brief RX window (configurable, default 2 s) for
+ * any responses, then return to sleep. The CPU continues running app_task
+ * normally throughout — only the radio is duty-cycled. */
+static void run_low_power_loop(void)
+{
+    sx1262_sleep(true);
+
+    for (;;) {
+        tx_request_t req;
+        if (xQueueReceive(s_tx_queue, &req, portMAX_DELAY) != pdTRUE) continue;
+
+        sx1262_wake();
+        do_tx(&req);
+
+        if (s_cfg.rx_window_ms > 0) {
+            run_rx_window(s_cfg.rx_window_ms);
+        }
+
+        sx1262_sleep(true);
+    }
+}
+
+void sx1262_run(void)
+{
+    set_packet_params(s_cfg.preamble_symbols, MAX_LORA_PAYLOAD,
+                      s_cfg.crc_on, s_cfg.iq_inverted);
+    clear_irq_status(SX_IRQ_ALL);
+
+    if (s_cfg.low_power) {
+        ESP_LOGI(TAG, "run loop: low-power (chip sleeps between TX events; "
+                 "rx_window=%lu ms)", (unsigned long)s_cfg.rx_window_ms);
+        run_low_power_loop();
+    } else {
+        ESP_LOGI(TAG, "run loop: continuous RX (always-on)");
+        run_continuous_loop();
     }
 }
