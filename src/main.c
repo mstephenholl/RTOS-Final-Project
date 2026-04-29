@@ -3,8 +3,9 @@
  *
  * Topology:
  *   CPU0 (PRO_CPU): app_task   — drives the OLED, runs the mesh state
- *                                machine (dedup + forward scheduler), and
- *                                originates periodic broadcasts.
+ *                                machine (dedup + forward scheduler +
+ *                                ACK retry tracker), and originates
+ *                                periodic broadcasts and unicasts.
  *   CPU1 (APP_CPU): lora_task  — owns the SX1262 state machine; on RX,
  *                                copies the packet into an rx_event_t and
  *                                posts it to s_rx_events. No I²C in the
@@ -17,21 +18,30 @@
  *   seq        - per-source monotonic counter, used as the dedup key
  *   dst_id     - target node, or MESH_BROADCAST (0xFF) for "everyone"
  *   hop_flags  - bits 7..4: TTL (0..15)
- *                bit 3:     wants_ack    (reserved for Tier 2)
- *                bit 2:     is_ack       (reserved for Tier 2)
+ *                bit 3:     wants_ack    (request an ACK from dst)
+ *                bit 2:     is_ack       (this frame is itself an ACK)
  *                bit 1:     is_forwarded (set by relay nodes)
  *                bit 0:     reserved
  *
+ *   ACK frames carry one body byte = original_seq being acknowledged.
+ *
  * Mesh behavior (Meshtastic-style flooding):
- *   - Each RX is dedup'd on (src_id, seq); duplicates are dropped silently.
+ *   - Each RX is dedup'd on (src_id, seq); duplicates are dropped silently
+ *     for routing/UI purposes — but ACK generation runs BEFORE dedup, so a
+ *     duplicate wants_ack frame triggers a re-ACK (loss recovery for the
+ *     return path).
  *   - Unique packets are delivered locally if dst matches us or is
  *     broadcast, and forwarded (TTL decremented) if not solely addressed
- *     to us. Forwards are scheduled with random 50–500 ms jitter to
- *     desynchronize neighbors that all hear the same broadcast at once;
- *     CAD-before-TX provides a second collision-avoidance layer.
- *   - We pre-record our own outgoing (s_node_id, s_tx_seq) into the dedup
- *     cache so neighbor forwards of our own packets get dropped on
- *     return.
+ *     to us. Forwards are scheduled with random 50–500 ms jitter.
+ *
+ * ACK protocol (Tier 2):
+ *   - Unicast TXs set wants_ack=1; broadcasts never do (would cause storms).
+ *   - Recipient generates ACK back to original sender. ACK src/seq are the
+ *     ACK sender's; ACK body is the original_seq being acknowledged.
+ *   - Originator tracks (dst_id, original_seq) in a pending table with
+ *     exponential-backoff retries (2 s, 4 s, 8 s; cap 12 s; up to 3 retries).
+ *   - Retry timing starts at sx1262_send enqueue, not air-side TX completion;
+ *     queue dwell is microseconds so the slop is invisible at our timescale.
  *
  * Display layout (text grid, 21 cols × 8 rows, rendered with 5x7 font):
  *
@@ -96,8 +106,9 @@ static uint32_t s_rx_count = 0;
 
 /* ---------------- Identity ---------------- */
 
-static uint8_t s_node_id = 0;
-static uint8_t s_tx_seq  = 0;
+static uint8_t s_node_id      = 0;
+static uint8_t s_tx_seq       = 0;
+static uint8_t s_last_seen_id = 0;   /* for choosing a unicast peer */
 
 static void init_node_id(void)
 {
@@ -120,19 +131,17 @@ static void init_node_id(void)
 /* ---------------- Dedup cache ---------------- */
 
 #define MESH_DEDUP_ENTRIES   32
-#define MESH_DEDUP_TTL_MS    30000   /* entries expire 30 s after insertion */
+#define MESH_DEDUP_TTL_MS    30000
 
 typedef struct {
     uint8_t    src_id;
     uint8_t    seq;
-    uint8_t    valid;        /* 0 = empty slot */
-    TickType_t expiry;       /* tick at which this entry becomes stale */
+    uint8_t    valid;
+    TickType_t expiry;
 } dedup_entry_t;
 
 static dedup_entry_t s_dedup[MESH_DEDUP_ENTRIES];
 
-/* If (src_id, seq) is already cached and unexpired, return true (duplicate).
- * Otherwise insert it and return false. Touched only by app_task. */
 static bool dedup_check_and_record(uint8_t src_id, uint8_t seq)
 {
     TickType_t now = xTaskGetTickCount();
@@ -151,7 +160,6 @@ static bool dedup_check_and_record(uint8_t src_id, uint8_t seq)
         if (e->src_id == src_id && e->seq == seq) {
             return true;
         }
-        /* Track the slot whose expiry is earliest, in case we need eviction. */
         if ((int32_t)(e->expiry - oldest_exp) < 0) {
             oldest_exp  = e->expiry;
             oldest_slot = i;
@@ -168,7 +176,7 @@ static bool dedup_check_and_record(uint8_t src_id, uint8_t seq)
 
 /* ---------------- Forward queue ---------------- */
 
-#define MESH_FORWARD_QUEUE_DEPTH  4
+#define MESH_FORWARD_QUEUE_DEPTH   4
 #define MESH_FORWARD_JITTER_MIN_MS 50
 #define MESH_FORWARD_JITTER_MAX_MS 500
 
@@ -220,7 +228,6 @@ static bool forward_schedule(const rx_event_t *evt)
     return true;
 }
 
-/* If a forward is due, copy it out and clear its slot. */
 static bool forward_pop_due(forward_t *out, TickType_t now)
 {
     int earliest = -1;
@@ -240,23 +247,127 @@ static bool forward_pop_due(forward_t *out, TickType_t now)
     return true;
 }
 
-/* Returns the earliest forward deadline, or portMAX_DELAY-equivalent
- * if the queue is empty. Caller computes wait time via signed subtraction. */
+/* Returns the earliest forward deadline, clamped to `fallback` from above. */
 static TickType_t forward_next_deadline(TickType_t fallback)
 {
     TickType_t earliest = fallback;
-    bool found = false;
     for (int i = 0; i < MESH_FORWARD_QUEUE_DEPTH; i++) {
         if (!s_fwd_queue[i].valid) continue;
-        if (!found || (int32_t)(s_fwd_queue[i].deadline - earliest) < 0) {
+        if ((int32_t)(s_fwd_queue[i].deadline - earliest) < 0) {
             earliest = s_fwd_queue[i].deadline;
-            found = true;
         }
     }
     return earliest;
 }
 
-/* ---------------- TX completion (still just logs in Tier 1) ---------------- */
+/* ---------------- ACK pending table ---------------- */
+
+#define ACK_PENDING_DEPTH       4
+#define ACK_TIMEOUT_INITIAL_MS  2000
+#define ACK_TIMEOUT_CAP_MS      12000
+#define ACK_MAX_RETRIES         3       /* total sends = 1 initial + 3 retries */
+
+typedef struct {
+    uint8_t    frame[FRAME_HEADER_LEN + FRAME_BODY_MAX];
+    uint8_t    len;
+    uint8_t    dst_id;
+    uint8_t    orig_seq;
+    uint8_t    attempt;       /* 0 = initial only, ≥1 = N retries done */
+    uint8_t    valid;
+    TickType_t next_retry;
+} ack_pending_t;
+
+static ack_pending_t s_ack_pending[ACK_PENDING_DEPTH];
+
+static void ack_pending_add(const uint8_t *frame, size_t len,
+                            uint8_t dst_id, uint8_t orig_seq)
+{
+    int slot = -1;
+    for (int i = 0; i < ACK_PENDING_DEPTH; i++) {
+        if (!s_ack_pending[i].valid) { slot = i; break; }
+    }
+    if (slot < 0) {
+        ESP_LOGW(TAG, "ack pending table full; not tracking #%02X seq %u",
+                 dst_id, orig_seq);
+        return;
+    }
+
+    ack_pending_t *p = &s_ack_pending[slot];
+    memcpy(p->frame, frame, len);
+    p->len        = (uint8_t)len;
+    p->dst_id     = dst_id;
+    p->orig_seq   = orig_seq;
+    p->attempt    = 0;
+    p->valid      = 1;
+    p->next_retry = xTaskGetTickCount() + pdMS_TO_TICKS(ACK_TIMEOUT_INITIAL_MS);
+}
+
+static void ack_clear_pending(uint8_t src_id, uint8_t orig_seq)
+{
+    for (int i = 0; i < ACK_PENDING_DEPTH; i++) {
+        ack_pending_t *p = &s_ack_pending[i];
+        if (p->valid && p->dst_id == src_id && p->orig_seq == orig_seq) {
+            ESP_LOGI(TAG, "ACK received from #%02X for seq %u (after %u %s)",
+                     src_id, orig_seq, p->attempt + 1,
+                     p->attempt == 0 ? "send" : "sends");
+            p->valid = 0;
+            return;
+        }
+    }
+}
+
+static int ack_due_index(TickType_t now)
+{
+    int earliest = -1;
+    TickType_t earliest_dl = 0;
+    for (int i = 0; i < ACK_PENDING_DEPTH; i++) {
+        if (!s_ack_pending[i].valid) continue;
+        if (earliest < 0 || (int32_t)(s_ack_pending[i].next_retry - earliest_dl) < 0) {
+            earliest    = i;
+            earliest_dl = s_ack_pending[i].next_retry;
+        }
+    }
+    if (earliest < 0) return -1;
+    if ((int32_t)(earliest_dl - now) > 0) return -1;
+    return earliest;
+}
+
+static TickType_t ack_next_deadline(TickType_t fallback)
+{
+    TickType_t earliest = fallback;
+    for (int i = 0; i < ACK_PENDING_DEPTH; i++) {
+        if (!s_ack_pending[i].valid) continue;
+        if ((int32_t)(s_ack_pending[i].next_retry - earliest) < 0) {
+            earliest = s_ack_pending[i].next_retry;
+        }
+    }
+    return earliest;
+}
+
+/* Send an ACK frame back to `orig_src` referring to its `orig_seq`. */
+static void ack_send(uint8_t orig_src, uint8_t orig_seq)
+{
+    uint8_t frame[FRAME_HEADER_LEN + 1];
+    frame[0] = s_node_id;
+    frame[1] = s_tx_seq;
+    frame[2] = orig_src;
+    frame[3] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT) | HOP_FLAGS_IS_ACK;
+    frame[4] = orig_seq;
+
+    /* Pre-record so neighbor forwards of our own ACK get dropped on return. */
+    (void)dedup_check_and_record(s_node_id, s_tx_seq);
+
+    sx1262_status_t s = sx1262_send(frame, sizeof(frame), pdMS_TO_TICKS(2000));
+    if (s == SX1262_OK) {
+        ESP_LOGI(TAG, "ACK TX: src=%02X seq=%u dst=%02X (acks #%02X seq %u)",
+                 s_node_id, s_tx_seq, orig_src, orig_src, orig_seq);
+        s_tx_seq++;
+    } else {
+        ESP_LOGW(TAG, "ACK enqueue failed (status %d)", s);
+    }
+}
+
+/* ---------------- TX completion (still just logs) ---------------- */
 
 static void on_tx_complete(sx1262_status_t status, size_t len)
 {
@@ -287,8 +398,13 @@ static void on_rx_packet(const uint8_t *data, size_t len, int8_t rssi, int8_t sn
     size_t body_len = len - FRAME_HEADER_LEN;
 
     uint8_t ttl = (hop_flags & HOP_FLAGS_TTL_MASK) >> HOP_FLAGS_TTL_SHIFT;
-    ESP_LOGI(TAG, "RX #%02X>%02X seq %u ttl %u  %u B  rssi=%d snr=%d  : %.*s",
-             src_id, dst_id, seq, ttl, (unsigned)body_len, rssi, snr,
+    bool is_ack    = (hop_flags & HOP_FLAGS_IS_ACK)    != 0;
+    bool wants_ack = (hop_flags & HOP_FLAGS_WANTS_ACK) != 0;
+    ESP_LOGI(TAG, "RX #%02X>%02X seq %u ttl %u%s%s  %u B  rssi=%d snr=%d  : %.*s",
+             src_id, dst_id, seq, ttl,
+             is_ack    ? " ACK"  : "",
+             wants_ack ? " WACK" : "",
+             (unsigned)body_len, rssi, snr,
              (int)body_len, (const char *)body);
 
     rx_event_t evt = {
@@ -303,8 +419,6 @@ static void on_rx_packet(const uint8_t *data, size_t len, int8_t rssi, int8_t sn
     };
     if (body_len > 0) memcpy(evt.data, body, body_len);
 
-    /* Drop on full: a missed display update is preferable to back-pressuring
-     * the radio task into an I²C-paced wait. */
     if (xQueueSend(s_rx_events, &evt, 0) != pdTRUE) {
         ESP_LOGW(TAG, "rx event queue full — dropping #%lu",
                  (unsigned long)s_rx_count);
@@ -335,21 +449,41 @@ static void render_rx_event(const rx_event_t *evt)
 
 static void handle_rx_event(const rx_event_t *evt)
 {
+    bool is_ack    = (evt->hop_flags & HOP_FLAGS_IS_ACK)    != 0;
+    bool wants_ack = (evt->hop_flags & HOP_FLAGS_WANTS_ACK) != 0;
+    uint8_t ttl = (evt->hop_flags & HOP_FLAGS_TTL_MASK) >> HOP_FLAGS_TTL_SHIFT;
+
+    /* Track the most recent peer we heard a non-ACK from; the unicast
+     * cadence sends to whoever was last to broadcast/unicast at us. */
+    if (!is_ack && evt->src_id != s_node_id) {
+        s_last_seen_id = evt->src_id;
+    }
+
+    /* (1) ACK reception: clear pending whether or not dedup catches a
+     *     duplicate ACK. Idempotent — re-clearing already-cleared is a no-op. */
+    if (is_ack && evt->dst_id == s_node_id && evt->len >= 1) {
+        ack_clear_pending(evt->src_id, evt->data[0]);
+    }
+
+    /* (2) ACK generation: respond to wants_ack addressed to us, even on
+     *     duplicates — the previous ACK may have been lost. */
+    if (wants_ack && !is_ack && evt->dst_id == s_node_id) {
+        ack_send(evt->src_id, evt->seq);
+    }
+
+    /* (3) Dedup for routing/UI decisions. */
     if (dedup_check_and_record(evt->src_id, evt->seq)) {
         ESP_LOGI(TAG, "dedup drop: #%02X seq %u", evt->src_id, evt->seq);
         return;
     }
 
+    /* (4) Local delivery (don't render ACKs — they're protocol traffic). */
     bool for_us = (evt->dst_id == s_node_id) || (evt->dst_id == MESH_BROADCAST);
-    if (for_us) render_rx_event(evt);
+    if (for_us && !is_ack) render_rx_event(evt);
 
-    /* Forward unless solely addressed to us. Broadcasts get forwarded too;
-     * dedup at neighbors handles the resulting redundancy. */
+    /* (5) Forwarding for anything not solely addressed to us. */
     bool should_forward = (evt->dst_id != s_node_id);
-    uint8_t ttl = (evt->hop_flags & HOP_FLAGS_TTL_MASK) >> HOP_FLAGS_TTL_SHIFT;
-    if (should_forward && ttl > 0) {
-        forward_schedule(evt);
-    }
+    if (should_forward && ttl > 0) forward_schedule(evt);
 }
 
 /* ---------------- Tasks ---------------- */
@@ -390,19 +524,43 @@ static void app_task(void *arg)
     /* Brief pause so the LoRa task finishes init before the first send. */
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    uint32_t n = 0;
+    uint32_t n = 0;             /* broadcast counter */
+    uint32_t ping_n = 0;        /* unicast/ping counter */
     char     text[40];
     uint8_t  frame[FRAME_HEADER_LEN + sizeof(text)];
 
-    /* TX every TX_INTERVAL; service RX events and forward deadlines in
-     * between via a deadline-bounded queue wait. */
-    const TickType_t TX_INTERVAL = pdMS_TO_TICKS(10000);
-    TickType_t next_tx = xTaskGetTickCount();
+    const TickType_t TX_INTERVAL      = pdMS_TO_TICKS(10000);
+    const TickType_t UNICAST_INTERVAL = pdMS_TO_TICKS(30000);
+    TickType_t next_tx      = xTaskGetTickCount();
+    TickType_t next_unicast = xTaskGetTickCount() + pdMS_TO_TICKS(15000);
 
     for (;;) {
         TickType_t now = xTaskGetTickCount();
 
-        /* 1. Fire forwards whose deadlines have arrived. */
+        /* 1. Service due ACK retries (highest priority — time-sensitive). */
+        int idx = ack_due_index(now);
+        if (idx >= 0) {
+            ack_pending_t *p = &s_ack_pending[idx];
+            if (p->attempt >= ACK_MAX_RETRIES) {
+                ESP_LOGW(TAG, "ACK timeout: gave up on #%02X seq %u after %u sends",
+                         p->dst_id, p->orig_seq, p->attempt + 1);
+                p->valid = 0;
+            } else {
+                p->attempt++;
+                ESP_LOGI(TAG, "ACK retry %u/%u: #%02X seq %u",
+                         p->attempt, ACK_MAX_RETRIES, p->dst_id, p->orig_seq);
+                sx1262_status_t s = sx1262_send(p->frame, p->len, pdMS_TO_TICKS(2000));
+                if (s != SX1262_OK) {
+                    ESP_LOGW(TAG, "ACK retry enqueue failed (status %d)", s);
+                }
+                uint32_t timeout_ms = (uint32_t)ACK_TIMEOUT_INITIAL_MS << p->attempt;
+                if (timeout_ms > ACK_TIMEOUT_CAP_MS) timeout_ms = ACK_TIMEOUT_CAP_MS;
+                p->next_retry = now + pdMS_TO_TICKS(timeout_ms);
+            }
+            continue;
+        }
+
+        /* 2. Service due forwards. */
         forward_t fwd;
         if (forward_pop_due(&fwd, now)) {
             sx1262_status_t s = sx1262_send(fwd.frame, fwd.len, pdMS_TO_TICKS(2000));
@@ -417,7 +575,7 @@ static void app_task(void *arg)
             continue;
         }
 
-        /* 2. Fire periodic origination if it's our turn. */
+        /* 3. Periodic broadcast. */
         if ((int32_t)(next_tx - now) <= 0) {
             int text_len = snprintf(text, sizeof(text),
                                     "hello from heltec v3 #%lu", (unsigned long)n);
@@ -430,13 +588,11 @@ static void app_task(void *arg)
             memcpy(&frame[FRAME_HEADER_LEN], text, (size_t)text_len);
             size_t frame_len = FRAME_HEADER_LEN + (size_t)text_len;
 
-            /* Pre-record so neighbor forwards of our own packet are dropped
-             * when they come back to us. */
             (void)dedup_check_and_record(s_node_id, s_tx_seq);
 
             sx1262_status_t s = sx1262_send(frame, frame_len, pdMS_TO_TICKS(2000));
             if (s == SX1262_OK) {
-                ESP_LOGI(TAG, "TX queued: src=%02X seq=%u dst=ALL ttl=%u \"%s\"",
+                ESP_LOGI(TAG, "TX bcast: src=%02X seq=%u dst=ALL ttl=%u \"%s\"",
                          s_node_id, s_tx_seq, MESH_TTL_DEFAULT, text);
                 s_tx_seq++;
                 ssd1306_printf(0, 3, "TX: %04lu  ID:%02X",
@@ -450,10 +606,46 @@ static void app_task(void *arg)
             continue;
         }
 
-        /* 3. Wait for the next event: either an RX or the nearest deadline
-         * (next TX, or next forward). */
-        TickType_t deadline = forward_next_deadline(next_tx);
-        if ((int32_t)(deadline - next_tx) > 0) deadline = next_tx;
+        /* 4. Periodic unicast w/ wants_ack — only if we've heard a peer. */
+        if ((int32_t)(next_unicast - now) <= 0) {
+            if (s_last_seen_id != 0) {
+                int text_len = snprintf(text, sizeof(text),
+                                        "ping #%lu to %02X",
+                                        (unsigned long)ping_n, s_last_seen_id);
+                if (text_len < 0) text_len = 0;
+
+                frame[0] = s_node_id;
+                frame[1] = s_tx_seq;
+                frame[2] = s_last_seen_id;
+                frame[3] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT)
+                         | HOP_FLAGS_WANTS_ACK;
+                memcpy(&frame[FRAME_HEADER_LEN], text, (size_t)text_len);
+                size_t frame_len = FRAME_HEADER_LEN + (size_t)text_len;
+
+                (void)dedup_check_and_record(s_node_id, s_tx_seq);
+
+                sx1262_status_t s = sx1262_send(frame, frame_len, pdMS_TO_TICKS(2000));
+                if (s == SX1262_OK) {
+                    ESP_LOGI(TAG, "TX unicast: src=%02X seq=%u dst=%02X "
+                             "wants_ack \"%s\"",
+                             s_node_id, s_tx_seq, s_last_seen_id, text);
+                    ack_pending_add(frame, frame_len, s_last_seen_id, s_tx_seq);
+                    s_tx_seq++;
+                    ping_n++;
+                } else {
+                    ESP_LOGW(TAG, "Unicast TX enqueue failed (status %d)", s);
+                }
+            }
+            next_unicast = xTaskGetTickCount() + UNICAST_INTERVAL;
+            continue;
+        }
+
+        /* 5. Wait until the soonest deadline (TX, unicast, forward, or ACK
+         *    retry), or until an RX event arrives. */
+        TickType_t deadline = next_tx;
+        if ((int32_t)(next_unicast - deadline) < 0) deadline = next_unicast;
+        deadline = forward_next_deadline(deadline);
+        deadline = ack_next_deadline(deadline);
         TickType_t wait = (int32_t)(deadline - now) > 0 ? (deadline - now) : 0;
 
         rx_event_t evt;
