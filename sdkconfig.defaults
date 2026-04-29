@@ -1,0 +1,21 @@
+# ---- FreeRTOS / SMP -------------------------------------------------------
+# Run scheduler on both cores. (Default in IDF 5.x, listed for clarity.)
+CONFIG_FREERTOS_UNICORE=n
+CONFIG_FREERTOS_NUMBER_OF_CORES=2
+# 1 kHz tick: pdMS_TO_TICKS(1) is exact, useful for short BUSY-poll backoffs.
+CONFIG_FREERTOS_HZ=1000
+
+# ---- Console over UART0 (CP2102) -----------------------------------------
+# Heltec V3.2 (HTIT-WB32LAF) routes USB-C through a Silicon Labs CP2102
+# bridge to the ESP32-S3's UART0 (TX=GPIO43, RX=GPIO44). We do NOT use the
+# S3's built-in USB-Serial-JTAG here because GPIO19/20 aren't brought out
+# to the connector on this board revision.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# ---- Stack / heap headroom -----------------------------------------------
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+
+# ---- Flash --------------------------------------------------------------
+# Heltec V3 ships with 8MB flash.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y

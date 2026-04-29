@@ -1,0 +1,21 @@
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+build/
+
+# ESP-IDF generates sdkconfig.<env> by merging sdkconfig.defaults with IDF
+# defaults. Keep the source of truth (defaults), drop the rest.
+sdkconfig
+sdkconfig.old
+sdkconfig.*
+!sdkconfig.defaults
+
+# Symlink to .pio-generated build artifact; regenerate via `pio run -t compiledb`.
+compile_commands.json
+
+*.o
+*.obj
+*.elf
+*.bin
+*.map
