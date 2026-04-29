@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 
 static const char *TAG = "sx1262_hal";
 
@@ -263,4 +264,19 @@ sx1262_status_t sx1262_hal_install_dio1_isr(void)
 bool sx1262_hal_wait_dio1(TickType_t timeout)
 {
     return xSemaphoreTake(s_dio1_sem, timeout) == pdTRUE;
+}
+
+/* ---------- Wake pulse for Sleep -> STDBY_RC ------------------------ */
+
+sx1262_status_t sx1262_hal_wake_pulse(void)
+{
+    /* DS §13.1.4: any NSS falling edge wakes the chip. We don't send SPI
+     * bytes during the wake — the chip's wakeup state machine isn't ready
+     * to interpret them yet. The pulse width isn't tightly specified;
+     * 20 µs is well above any reasonable threshold. */
+    gpio_set_level(SX1262_PIN_NSS, 0);
+    esp_rom_delay_us(20);
+    gpio_set_level(SX1262_PIN_NSS, 1);
+    /* tWAKE up to ~5 ms; allow margin. */
+    return sx1262_hal_wait_busy(20);
 }

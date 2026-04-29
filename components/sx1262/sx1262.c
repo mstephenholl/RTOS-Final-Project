@@ -344,6 +344,22 @@ sx1262_status_t sx1262_send(const uint8_t *data, size_t len, TickType_t timeout)
             ? SX1262_OK : SX1262_ERR_QUEUE_FULL;
 }
 
+sx1262_status_t sx1262_sleep(bool warm)
+{
+    /* DS §13.1.4 SetSleep:
+     *   bit 2 = startup mode (0 = cold, 1 = warm)
+     *   bit 0 = RTC wake-up (0 = disabled — we wake via NSS pulse)
+     * WARM preserves data buffer + all config; COLD loses them and forces
+     * a full sx1262_init() on wake. */
+    uint8_t cfg = warm ? 0x04 : 0x00;
+    return sx1262_hal_cmd(SX_CMD_SET_SLEEP, &cfg, 1);
+}
+
+sx1262_status_t sx1262_wake(void)
+{
+    return sx1262_hal_wake_pulse();
+}
+
 /* ---------------------------------------------------------------------- */
 /*  TX / RX execution (runs only inside sx1262_run)                       */
 /* ---------------------------------------------------------------------- */

@@ -47,3 +47,9 @@ sx1262_status_t sx1262_hal_install_dio1_isr(void);
 /* Block up to `timeout` ticks for the next DIO1 IRQ. Returns true if one
  * arrived, false on timeout. */
 bool sx1262_hal_wait_dio1(TickType_t timeout);
+
+/* Pulse NSS low briefly to wake the chip from Sleep. The chip transitions
+ * Sleep -> STDBY_RC on the NSS falling edge; we wait for BUSY to drop
+ * (tWAKE ≈ 5 ms per DS) before returning so the caller can issue
+ * commands immediately. No SPI bytes are sent. */
+sx1262_status_t sx1262_hal_wake_pulse(void);

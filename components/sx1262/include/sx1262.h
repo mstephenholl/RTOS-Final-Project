@@ -56,3 +56,21 @@ sx1262_status_t sx1262_send(const uint8_t *data, size_t len, TickType_t timeout)
 /* The LoRa task body. Blocks forever, servicing the TX queue and dispatching
  * RX_DONE events to the configured callback. Call from the LoRa-pinned task. */
 void sx1262_run(void);
+
+/* Put the chip into Sleep mode. WARM (true) preserves the 256-byte data
+ * buffer and modulation/packet parameters across sleep — recommended for
+ * beacon-rate workloads where the wake cost dominates the leakage savings.
+ * COLD (false) loses configuration and data buffer; sx1262_init() must be
+ * re-run before resuming RX/TX.
+ *
+ * Thread safety: sx1262_run() must NOT be active when this is called, or
+ * its RX/TX state machine will get stuck waiting on DIO1 from an asleep
+ * chip. Tier 2 of the sleep-mode work integrates this into sx1262_run. */
+sx1262_status_t sx1262_sleep(bool warm);
+
+/* Wake the chip from Sleep into STDBY_RC. Pulses NSS to trigger the
+ * Sleep -> STDBY_RC transition, then waits for BUSY to drop. After a WARM
+ * sleep, the chip is ready to use immediately (re-issue SetRx/SetTx as
+ * needed). After COLD sleep, configuration is gone — call sx1262_init()
+ * before resuming. */
+sx1262_status_t sx1262_wake(void);
