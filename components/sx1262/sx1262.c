@@ -21,6 +21,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_random.h"
 
 static const char *TAG = "sx1262";
 
@@ -215,6 +216,38 @@ static sx1262_status_t set_sync_word(uint16_t sw)
     return sx1262_hal_write_reg(SX_REG_LSYNCRH, v, 2);
 }
 
+/* DS-recommended cadDetPeak per SF (Semtech AN1200.48). */
+static uint8_t cad_det_peak_for_sf(uint8_t sf)
+{
+    if (sf <= 8)  return 22;
+    if (sf == 9)  return 23;
+    if (sf == 10) return 24;
+    if (sf == 11) return 25;
+    return 28;  /* SF12 */
+}
+
+static sx1262_status_t set_cad_params(uint8_t sf)
+{
+    /* SetCadParams (DS table 13-44):
+     *   [cadSymbolNum] [cadDetPeak] [cadDetMin] [cadExitMode] [cadTimeout(24-bit)]
+     * cadSymbolNum = 0x02 → 4-symbol listen window (good balance for SF7-12).
+     * cadExitMode  = 0x00 → CAD_ONLY: return to STDBY_RC after CAD completes.
+     * cadTimeout   = 0   → unused in CAD_ONLY. */
+    uint8_t p[7] = {
+        0x02,
+        cad_det_peak_for_sf(sf),
+        10,
+        0x00,
+        0x00, 0x00, 0x00,
+    };
+    return sx1262_hal_cmd(SX_CMD_SET_CAD_PARAMS, p, 7);
+}
+
+static sx1262_status_t enter_cad(void)
+{
+    return sx1262_hal_cmd(SX_CMD_SET_CAD, NULL, 0);
+}
+
 static sx1262_status_t enter_rx_continuous(void)
 {
     /* 0xFFFFFF in the timeout field = continuous RX. */
@@ -278,8 +311,12 @@ sx1262_status_t sx1262_init(const sx1262_config_t *cfg)
     s = set_sync_word(s_cfg.sync_word);                    if (s != SX1262_OK) return s;
     s = set_buffer_base(0, 0);                             if (s != SX1262_OK) return s;
 
+    /* 6.5. CAD params (used by do_tx as listen-before-talk). */
+    s = set_cad_params(s_cfg.spreading_factor);            if (s != SX1262_OK) return s;
+
     /* 7. Route the relevant LoRa events to DIO1. */
-    uint16_t mask = SX_IRQ_TX_DONE | SX_IRQ_RX_DONE | SX_IRQ_TIMEOUT | SX_IRQ_CRC_ERR;
+    uint16_t mask = SX_IRQ_TX_DONE | SX_IRQ_RX_DONE | SX_IRQ_TIMEOUT |
+                    SX_IRQ_CRC_ERR | SX_IRQ_CAD_DONE | SX_IRQ_CAD_DETECTED;
     s = set_dio_irq_params(mask, mask, 0, 0);              if (s != SX1262_OK) return s;
 
     /* 8. ISR + queue. */
@@ -310,8 +347,55 @@ sx1262_status_t sx1262_send(const uint8_t *data, size_t len, TickType_t timeout)
 /*  TX / RX execution (runs only inside sx1262_run)                       */
 /* ---------------------------------------------------------------------- */
 
+#define MAX_CAD_RETRIES 3
+
+/* Returns true if CAD detected a LoRa preamble on our channel. Leaves the
+ * chip in STDBY_RC regardless of outcome (cadExitMode = CAD_ONLY). */
+static bool channel_busy(void)
+{
+    set_standby(SX_STANDBY_RC);
+    clear_irq_status(SX_IRQ_ALL);
+
+    /* Drain any spurious DIO1 give from prior events. */
+    (void)sx1262_hal_wait_dio1(0);
+
+    enter_cad();
+
+    /* CAD with 4 symbols at SF7/BW125 ≈ 4 ms; longer at higher SF.
+     * 50 ms covers SF12 (32 ms/symbol × 4 = 128 ms… revisit if SF>10). */
+    if (!sx1262_hal_wait_dio1(pdMS_TO_TICKS(50))) {
+        ESP_LOGW(TAG, "CAD: DIO1 never fired");
+        return false;  /* assume clear so we don't permanently defer */
+    }
+
+    uint16_t irq = 0;
+    get_irq_status(&irq);
+    clear_irq_status(SX_IRQ_ALL);
+
+    return (irq & SX_IRQ_CAD_DETECTED) != 0;
+}
+
 static void do_tx(const tx_request_t *req)
 {
+    /* CAD-before-TX: listen for an in-progress LoRa transmission; on
+     * detection, back off with random jitter and retry. After
+     * MAX_CAD_RETRIES we transmit anyway — the channel may be persistently
+     * busy and the upper layer's cadence is what gates retry-bombing. */
+    for (int attempt = 1; attempt <= MAX_CAD_RETRIES; attempt++) {
+        if (!channel_busy()) break;
+
+        if (attempt == MAX_CAD_RETRIES) {
+            ESP_LOGW(TAG, "CAD: channel busy after %d attempts, TXing anyway",
+                     MAX_CAD_RETRIES);
+            break;
+        }
+
+        uint32_t jitter_ms = 5 + (esp_random() % 46);  /* 5..50 ms */
+        ESP_LOGI(TAG, "CAD: busy, backoff %lu ms (attempt %d/%d)",
+                 (unsigned long)jitter_ms, attempt, MAX_CAD_RETRIES);
+        vTaskDelay(pdMS_TO_TICKS(jitter_ms));
+    }
+
     /* Re-set packet params with the actual payload length so the chip's
      * implicit-mode optimizations (if ever enabled) get the right value. */
     set_packet_params(s_cfg.preamble_symbols, req->len,
@@ -319,7 +403,7 @@ static void do_tx(const tx_request_t *req)
     sx1262_hal_write_buf(0, req->data, req->len);
     clear_irq_status(SX_IRQ_ALL);
 
-    /* Drain any spurious pending DIO1 give from prior RX events. */
+    /* Drain any spurious pending DIO1 give. */
     (void)sx1262_hal_wait_dio1(0);
 
     enter_tx(0);                          /* 0 = no chip-side timeout */

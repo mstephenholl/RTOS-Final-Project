@@ -4,5 +4,5 @@ idf_component_register(
         "sx1262_hal.c"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "."
-    REQUIRES driver freertos esp_timer log
+    REQUIRES driver freertos esp_timer log esp_hw_support
 )
