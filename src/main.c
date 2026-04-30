@@ -73,6 +73,10 @@
 #include "esp_pm.h"
 #endif
 
+#ifdef ENABLE_DEEP_SLEEP
+#include "esp_sleep.h"
+#endif
+
 #include "sx1262.h"
 #include "ssd1306.h"
 
@@ -949,6 +953,95 @@ static void app_task(void *arg)
     }
 }
 
+#ifdef ENABLE_DEEP_SLEEP
+
+/* Time the chip stays in deep sleep between cycles. */
+#ifndef DEEP_SLEEP_INTERVAL_S
+#define DEEP_SLEEP_INTERVAL_S  60
+#endif
+/* Post-TX RX window in deep-sleep mode (allows brief listen for unsolicited
+ * traffic; not used for ACKs since deep-sleep nodes don't track them across
+ * sleeps anyway — RAM is lost). */
+#ifndef DEEP_SLEEP_RX_WINDOW_MS
+#define DEEP_SLEEP_RX_WINDOW_MS 2000
+#endif
+
+/* Deep-sleep one-shot: boot, transmit one beacon, brief listen, sleep.
+ * The whole active phase takes a couple hundred ms. The chip wakes via
+ * RTC timer and reboots from scratch — there's no FreeRTOS task that
+ * survives across cycles, so persistent state lives in NVS. */
+static void deep_sleep_main(void)
+{
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    ESP_LOGI(TAG, "deep-sleep wake (cause=%d), role=%s seq=%lu",
+             (int)cause, role_name(), (unsigned long)s_tx_seq);
+
+    /* Radio init — low_power so the chip starts asleep. send_now wakes
+     * it for the TX cycle, listen_for keeps it awake for the window. */
+    sx1262_config_t cfg = sx1262_default_config();
+    cfg.rx_callback = on_rx_packet;
+    cfg.tx_callback = on_tx_complete;
+    cfg.low_power   = true;
+    if (sx1262_init(&cfg) != SX1262_OK) {
+        ESP_LOGE(TAG, "sx1262_init failed; sleeping anyway to avoid burn loop");
+        goto sleep;
+    }
+
+    /* Compose a broadcast beacon. We deliberately don't set wants_ack —
+     * a deep-sleep node can't track pending ACKs across sleep cycles. */
+    char    text[40];
+    int     text_len = snprintf(text, sizeof(text),
+                                "deep-sleep beacon seq=%lu",
+                                (unsigned long)(s_tx_seq & 0xFFu));
+    if (text_len < 0) text_len = 0;
+
+    uint8_t frame[FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN + sizeof(text)];
+    frame[0] = s_channel_hash;
+    frame[1] = s_node_id;
+    frame[2] = (uint8_t)s_tx_seq;
+    frame[3] = MESH_BROADCAST;
+    frame[4] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT);
+
+    uint32_t enc_ctr = s_tx_seq;
+    frame[FRAME_HEADER_LEN + 0] = (uint8_t)(enc_ctr      );
+    frame[FRAME_HEADER_LEN + 1] = (uint8_t)(enc_ctr >>  8);
+    frame[FRAME_HEADER_LEN + 2] = (uint8_t)(enc_ctr >> 16);
+    frame[FRAME_HEADER_LEN + 3] = (uint8_t)(enc_ctr >> 24);
+
+    aes_crypt(&frame[FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN],
+              (const uint8_t *)text, (size_t)text_len, s_node_id, enc_ctr);
+    size_t frame_len = FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN + (size_t)text_len;
+
+    ESP_LOGI(TAG, "TX beacon: src=%02X seq=%u dst=ALL ttl=%u \"%s\"",
+             s_node_id, (unsigned)(s_tx_seq & 0xFFu),
+             MESH_TTL_DEFAULT, text);
+
+    if (sx1262_send_now(frame, frame_len) == SX1262_OK) {
+        seq_persist_advance();
+    }
+
+    /* Brief listen for unsolicited traffic (mostly for educational
+     * visibility — the rx_callback fires and queues to s_rx_events, but
+     * no one drains it before we sleep). */
+    sx1262_listen_for(DEEP_SLEEP_RX_WINDOW_MS);
+
+    /* Drop the chip into WARM sleep (~160 nA) before the MCU does. */
+    sx1262_sleep(true);
+
+sleep:
+    {
+        uint64_t sleep_us = (uint64_t)DEEP_SLEEP_INTERVAL_S * 1000000ULL;
+        esp_sleep_enable_timer_wakeup(sleep_us);
+        ESP_LOGI(TAG, "entering deep sleep for %u s", DEEP_SLEEP_INTERVAL_S);
+        /* Brief delay so the log line completes over UART before we cut. */
+        vTaskDelay(pdMS_TO_TICKS(20));
+        esp_deep_sleep_start();
+    }
+    /* Never returns. */
+}
+
+#endif  /* ENABLE_DEEP_SLEEP */
+
 void app_main(void)
 {
     nvs_init_safe();
@@ -956,6 +1049,12 @@ void app_main(void)
     seq_persist_init();
     init_channel_hash();
     aes_init_safe();
+
+#ifdef ENABLE_DEEP_SLEEP
+    /* One-shot path. Never returns. OLED is intentionally NOT initialized
+     * (would otherwise dominate the sleep-state power budget at ~3 mA). */
+    deep_sleep_main();
+#endif
 
 #ifdef ENABLE_LIGHT_SLEEP
     /* Light sleep via the IDF PM framework. The kernel automatically

@@ -84,3 +84,15 @@ sx1262_status_t sx1262_wake(void);
  * using ESP-side power management. The driver's normal edge ISR continues
  * to function alongside this. */
 sx1262_status_t sx1262_enable_dio1_wake(void);
+
+/* Synchronous TX, bypasses the TX queue. Wakes the chip if asleep,
+ * runs CAD-before-TX, transmits, fires tx_callback when on-air. Returns
+ * after the chip's TX_DONE (or driver-internal timeout). Use this in
+ * deep-sleep / one-shot flows where the run loop isn't active. */
+sx1262_status_t sx1262_send_now(const uint8_t *data, size_t len);
+
+/* Open a bounded RX window. Returns when window_ms ticks have elapsed,
+ * dispatching any RX_DONE events to the configured rx_callback as they
+ * arrive. The chip is in RX_CONTINUOUS while the window is open and in
+ * STDBY_RC after the call returns. */
+sx1262_status_t sx1262_listen_for(uint32_t window_ms);

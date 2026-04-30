@@ -36,6 +36,10 @@ typedef struct {
 static QueueHandle_t   s_tx_queue;
 static sx1262_config_t s_cfg;
 
+/* Forward declarations for one-shot helpers (sx1262_send_now / sx1262_listen_for). */
+static void do_tx(const tx_request_t *req);
+static void run_rx_window(uint32_t window_ms);
+
 /* ---------------------------------------------------------------------- */
 /*  Defaults                                                              */
 /* ---------------------------------------------------------------------- */
@@ -365,6 +369,28 @@ sx1262_status_t sx1262_wake(void)
 sx1262_status_t sx1262_enable_dio1_wake(void)
 {
     return sx1262_hal_enable_dio1_wake();
+}
+
+sx1262_status_t sx1262_send_now(const uint8_t *data, size_t len)
+{
+    if (!data || len == 0 || len > MAX_LORA_PAYLOAD) return SX1262_ERR_PARAM;
+
+    tx_request_t req;
+    req.len = (uint8_t)len;
+    memcpy(req.data, data, len);
+
+    /* Wake from sleep if the chip is there (no-op if already awake). */
+    sx1262_wake();
+    do_tx(&req);
+    return SX1262_OK;
+}
+
+sx1262_status_t sx1262_listen_for(uint32_t window_ms)
+{
+    if (window_ms == 0) return SX1262_OK;
+    sx1262_wake();
+    run_rx_window(window_ms);
+    return SX1262_OK;
 }
 
 /* ---------------------------------------------------------------------- */
