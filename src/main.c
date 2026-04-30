@@ -79,6 +79,7 @@
 
 #include "sx1262.h"
 #include "ssd1306.h"
+#include "instrumentation.h"
 
 static const char *TAG = "app";
 
@@ -613,6 +614,7 @@ static void on_tx_complete(sx1262_status_t status, size_t len)
     } else {
         ESP_LOGW(TAG, "TX air-side failure (status %d, %u B)", status, (unsigned)len);
     }
+    instr_log(INSTR_EVT_TX_DONE, INSTR_TASK_LORA, (uint32_t)len);
 }
 
 /* ---------------- RX path ---------------- */
@@ -688,6 +690,7 @@ static void on_rx_packet(const uint8_t *data, size_t len, int8_t rssi, int8_t sn
         ESP_LOGW(TAG, "rx event queue full — dropping #%lu",
                  (unsigned long)s_rx_count);
     }
+    instr_log(INSTR_EVT_RX, INSTR_TASK_LORA, ((uint32_t)src_id << 8) | seq);
 }
 
 /* ---------------- OLED render ---------------- */
@@ -1049,6 +1052,7 @@ void app_main(void)
     seq_persist_init();
     init_channel_hash();
     aes_init_safe();
+    instr_init();
 
 #ifdef ENABLE_DEEP_SLEEP
     /* One-shot path. Never returns. OLED is intentionally NOT initialized
@@ -1104,4 +1108,6 @@ void app_main(void)
             NULL,
             APP_PINNED_CORE);
     configASSERT(ok == pdPASS);
+
+    instr_start_load_tasks();
 }
