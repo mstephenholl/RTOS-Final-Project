@@ -66,6 +66,7 @@
 #include "esp_random.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "mbedtls/aes.h"
 
 #include "sx1262.h"
 #include "ssd1306.h"
@@ -115,7 +116,10 @@ static const char *role_name(void)
 /* ---------------- Frame format ---------------- */
 
 #define FRAME_HEADER_LEN          4
-#define FRAME_BODY_MAX            (255 - FRAME_HEADER_LEN)   /* 251 */
+#define FRAME_ENC_PREFIX_LEN      4    /* enc_counter (u32 LE), plaintext */
+#define FRAME_WIRE_MAX            255  /* SX1262 max LoRa payload */
+#define FRAME_BODY_MAX            (FRAME_WIRE_MAX - FRAME_HEADER_LEN - FRAME_ENC_PREFIX_LEN)
+                                  /* = 247: max plaintext body length */
 
 #define HOP_FLAGS_TTL_SHIFT       4
 #define HOP_FLAGS_TTL_MASK        0xF0u
@@ -129,15 +133,16 @@ static const char *role_name(void)
 /* ---------------- Cross-task RX event ---------------- */
 
 typedef struct {
-    uint8_t  data[FRAME_BODY_MAX];
-    uint8_t  len;            /* body length, post-header */
+    uint8_t  data[FRAME_BODY_MAX];   /* decrypted plaintext */
+    uint8_t  len;                    /* plaintext length */
     uint8_t  src_id;
     uint8_t  seq;
     uint8_t  dst_id;
     uint8_t  hop_flags;
     int8_t   rssi;
     int8_t   snr;
-    uint32_t count;          /* 1-based RX index assigned at reception time */
+    uint32_t count;                  /* 1-based RX index assigned at reception */
+    uint32_t enc_counter;            /* needed to re-encrypt for forwarding */
 } rx_event_t;
 
 #define RX_EVENT_QUEUE_DEPTH 4
@@ -237,6 +242,63 @@ static void init_node_id(void)
     ESP_LOGI(TAG, "node ID: 0x%02X", s_node_id);
 }
 
+/* ---------------- Channel encryption (AES-128-CTR) ---------------- */
+
+/* Hardcoded channel key. Production deployments would derive this from a
+ * passphrase via PBKDF2 or similar; for the educational artifact it's a
+ * compile-time constant. Anyone with this firmware can read the channel.
+ *
+ * SECURITY NOTE: AES-CTR provides confidentiality only — an attacker can
+ * still flip ciphertext bits to flip the same plaintext bits (malleability).
+ * Real production needs AES-GCM or AES-CTR + HMAC. Replay is mitigated by
+ * dedup, not by this layer. */
+static const uint8_t s_channel_key[16] = {
+    0x4D, 0x65, 0x73, 0x68, 0x4C, 0x6F, 0x52, 0x61,
+    0x52, 0x54, 0x4F, 0x53, 0x4C, 0x65, 0x61, 0x66,
+};
+static mbedtls_aes_context s_aes_ctx;
+
+static void aes_init_safe(void)
+{
+    mbedtls_aes_init(&s_aes_ctx);
+    int ret = mbedtls_aes_setkey_enc(&s_aes_ctx, s_channel_key, 128);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "mbedtls_aes_setkey_enc failed (%d)", ret);
+    }
+}
+
+/* Build a 16-byte CTR nonce_counter block. Bytes 0..4 = (src_id, enc_ctr_LE);
+ * bytes 5..15 = 0 and serve as the per-block counter that AES-CTR increments
+ * internally. 40 bits of nonce uniqueness covers 2^40 distinct frames per
+ * channel — astronomical at our TX rate. */
+static void aes_make_nonce(uint8_t out[16], uint8_t src_id, uint32_t enc_ctr)
+{
+    memset(out, 0, 16);
+    out[0] = src_id;
+    out[1] = (uint8_t)(enc_ctr      );
+    out[2] = (uint8_t)(enc_ctr >>  8);
+    out[3] = (uint8_t)(enc_ctr >> 16);
+    out[4] = (uint8_t)(enc_ctr >> 24);
+}
+
+/* Symmetric: same call encrypts and decrypts (CTR mode). Safe for concurrent
+ * calls from lora_task and app_task — after setkey, s_aes_ctx is read-only
+ * during crypt operations. */
+static void aes_crypt(uint8_t *output, const uint8_t *input, size_t len,
+                      uint8_t src_id, uint32_t enc_ctr)
+{
+    if (len == 0) return;
+    uint8_t nonce_counter[16];
+    aes_make_nonce(nonce_counter, src_id, enc_ctr);
+    uint8_t stream_block[16] = {0};
+    size_t  nc_off = 0;
+    int ret = mbedtls_aes_crypt_ctr(&s_aes_ctx, len, &nc_off, nonce_counter,
+                                    stream_block, input, output);
+    if (ret != 0) {
+        ESP_LOGW(TAG, "mbedtls_aes_crypt_ctr failed (%d)", ret);
+    }
+}
+
 /* ---------------- Dedup cache ---------------- */
 
 #define MESH_DEDUP_ENTRIES   32
@@ -290,7 +352,7 @@ static bool dedup_check_and_record(uint8_t src_id, uint8_t seq)
 #define MESH_FORWARD_JITTER_MAX_MS 500
 
 typedef struct {
-    uint8_t    frame[FRAME_HEADER_LEN + FRAME_BODY_MAX];
+    uint8_t    frame[FRAME_WIRE_MAX];   /* encrypted wire bytes ready to TX */
     uint8_t    len;
     uint8_t    valid;
     TickType_t deadline;
@@ -319,12 +381,26 @@ static bool forward_schedule(const rx_event_t *evt)
                       | (new_ttl << HOP_FLAGS_TTL_SHIFT)
                       | HOP_FLAGS_IS_FORWARDED;
 
+    /* Header — TTL decremented and IS_FORWARDED set. */
     f->frame[0] = evt->src_id;
     f->frame[1] = evt->seq;
     f->frame[2] = evt->dst_id;
     f->frame[3] = new_flags;
-    if (evt->len > 0) memcpy(&f->frame[FRAME_HEADER_LEN], evt->data, evt->len);
-    f->len   = FRAME_HEADER_LEN + evt->len;
+
+    /* Plaintext enc_counter prefix — same value the originator used so any
+     * receiver can reproduce the nonce. */
+    f->frame[FRAME_HEADER_LEN + 0] = (uint8_t)(evt->enc_counter      );
+    f->frame[FRAME_HEADER_LEN + 1] = (uint8_t)(evt->enc_counter >>  8);
+    f->frame[FRAME_HEADER_LEN + 2] = (uint8_t)(evt->enc_counter >> 16);
+    f->frame[FRAME_HEADER_LEN + 3] = (uint8_t)(evt->enc_counter >> 24);
+
+    /* Re-encrypt the body with the originator's (src_id, enc_counter). The
+     * resulting ciphertext bytes are bit-identical to what we received. */
+    if (evt->len > 0) {
+        aes_crypt(&f->frame[FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN],
+                  evt->data, evt->len, evt->src_id, evt->enc_counter);
+    }
+    f->len   = FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN + evt->len;
     f->valid = 1;
 
     uint32_t span = MESH_FORWARD_JITTER_MAX_MS - MESH_FORWARD_JITTER_MIN_MS + 1;
@@ -377,7 +453,7 @@ static TickType_t forward_next_deadline(TickType_t fallback)
 #define ACK_MAX_RETRIES         3       /* total sends = 1 initial + 3 retries */
 
 typedef struct {
-    uint8_t    frame[FRAME_HEADER_LEN + FRAME_BODY_MAX];
+    uint8_t    frame[FRAME_WIRE_MAX];   /* encrypted wire bytes for retry */
     uint8_t    len;
     uint8_t    dst_id;
     uint8_t    orig_seq;
@@ -456,12 +532,22 @@ static TickType_t ack_next_deadline(TickType_t fallback)
 /* Send an ACK frame back to `orig_src` referring to its `orig_seq`. */
 static void ack_send(uint8_t orig_src, uint8_t orig_seq)
 {
-    uint8_t frame[FRAME_HEADER_LEN + 1];
+    uint8_t frame[FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN + 1];
     frame[0] = s_node_id;
     frame[1] = (uint8_t)s_tx_seq;
     frame[2] = orig_src;
     frame[3] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT) | HOP_FLAGS_IS_ACK;
-    frame[4] = orig_seq;
+
+    uint32_t enc_ctr = s_tx_seq;
+    frame[4] = (uint8_t)(enc_ctr      );
+    frame[5] = (uint8_t)(enc_ctr >>  8);
+    frame[6] = (uint8_t)(enc_ctr >> 16);
+    frame[7] = (uint8_t)(enc_ctr >> 24);
+
+    /* Encrypt the 1-byte body in place. */
+    uint8_t plaintext_body = orig_seq;
+    aes_crypt(&frame[FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN],
+              &plaintext_body, 1, s_node_id, enc_ctr);
 
     /* Pre-record so neighbor forwards of our own ACK get dropped on return. */
     (void)dedup_check_and_record(s_node_id, (uint8_t)s_tx_seq);
@@ -494,8 +580,8 @@ static void on_rx_packet(const uint8_t *data, size_t len, int8_t rssi, int8_t sn
 {
     s_rx_count++;
 
-    if (len < FRAME_HEADER_LEN) {
-        ESP_LOGW(TAG, "RX %u B  rssi=%d  snr=%d  (no frame header — dropped)",
+    if (len < FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN) {
+        ESP_LOGW(TAG, "RX %u B  rssi=%d  snr=%d  (too short — dropped)",
                  (unsigned)len, rssi, snr);
         return;
     }
@@ -504,8 +590,26 @@ static void on_rx_packet(const uint8_t *data, size_t len, int8_t rssi, int8_t sn
     uint8_t seq       = data[1];
     uint8_t dst_id    = data[2];
     uint8_t hop_flags = data[3];
-    const uint8_t *body = &data[FRAME_HEADER_LEN];
-    size_t body_len = len - FRAME_HEADER_LEN;
+
+    uint32_t enc_counter = (uint32_t)data[4]
+                         | ((uint32_t)data[5] <<  8)
+                         | ((uint32_t)data[6] << 16)
+                         | ((uint32_t)data[7] << 24);
+
+    const uint8_t *enc_body = &data[FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN];
+    size_t body_len = len - FRAME_HEADER_LEN - FRAME_ENC_PREFIX_LEN;
+
+    if (body_len > FRAME_BODY_MAX) {
+        ESP_LOGW(TAG, "RX body too large (%u > %u)",
+                 (unsigned)body_len, (unsigned)FRAME_BODY_MAX);
+        return;
+    }
+
+    /* Decrypt body in place into a staging buffer. */
+    uint8_t plaintext[FRAME_BODY_MAX];
+    if (body_len > 0) {
+        aes_crypt(plaintext, enc_body, body_len, src_id, enc_counter);
+    }
 
     uint8_t ttl = (hop_flags & HOP_FLAGS_TTL_MASK) >> HOP_FLAGS_TTL_SHIFT;
     bool is_ack    = (hop_flags & HOP_FLAGS_IS_ACK)    != 0;
@@ -515,19 +619,20 @@ static void on_rx_packet(const uint8_t *data, size_t len, int8_t rssi, int8_t sn
              is_ack    ? " ACK"  : "",
              wants_ack ? " WACK" : "",
              (unsigned)body_len, rssi, snr,
-             (int)body_len, (const char *)body);
+             (int)body_len, (const char *)plaintext);
 
     rx_event_t evt = {
-        .len       = (uint8_t)body_len,
-        .src_id    = src_id,
-        .seq       = seq,
-        .dst_id    = dst_id,
-        .hop_flags = hop_flags,
-        .rssi      = rssi,
-        .snr       = snr,
-        .count     = s_rx_count,
+        .len         = (uint8_t)body_len,
+        .src_id      = src_id,
+        .seq         = seq,
+        .dst_id      = dst_id,
+        .hop_flags   = hop_flags,
+        .rssi        = rssi,
+        .snr         = snr,
+        .count       = s_rx_count,
+        .enc_counter = enc_counter,
     };
-    if (body_len > 0) memcpy(evt.data, body, body_len);
+    if (body_len > 0) memcpy(evt.data, plaintext, body_len);
 
     if (xQueueSend(s_rx_events, &evt, 0) != pdTRUE) {
         ESP_LOGW(TAG, "rx event queue full — dropping #%lu",
@@ -641,7 +746,7 @@ static void app_task(void *arg)
     uint32_t n = 0;             /* broadcast counter */
     uint32_t ping_n = 0;        /* unicast/ping counter */
     char     text[40];
-    uint8_t  frame[FRAME_HEADER_LEN + sizeof(text)];
+    uint8_t  frame[FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN + sizeof(text)];
 
     const TickType_t TX_INTERVAL      = pdMS_TO_TICKS(10000);
     const TickType_t UNICAST_INTERVAL = pdMS_TO_TICKS(30000);
@@ -699,8 +804,17 @@ static void app_task(void *arg)
             frame[1] = (uint8_t)s_tx_seq;
             frame[2] = MESH_BROADCAST;
             frame[3] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT);
-            memcpy(&frame[FRAME_HEADER_LEN], text, (size_t)text_len);
-            size_t frame_len = FRAME_HEADER_LEN + (size_t)text_len;
+
+            uint32_t enc_ctr = s_tx_seq;
+            frame[4] = (uint8_t)(enc_ctr      );
+            frame[5] = (uint8_t)(enc_ctr >>  8);
+            frame[6] = (uint8_t)(enc_ctr >> 16);
+            frame[7] = (uint8_t)(enc_ctr >> 24);
+
+            aes_crypt(&frame[FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN],
+                      (const uint8_t *)text, (size_t)text_len,
+                      s_node_id, enc_ctr);
+            size_t frame_len = FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN + (size_t)text_len;
 
             (void)dedup_check_and_record(s_node_id, (uint8_t)s_tx_seq);
 
@@ -735,8 +849,17 @@ static void app_task(void *arg)
                 frame[2] = s_last_seen_id;
                 frame[3] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT)
                          | HOP_FLAGS_WANTS_ACK;
-                memcpy(&frame[FRAME_HEADER_LEN], text, (size_t)text_len);
-                size_t frame_len = FRAME_HEADER_LEN + (size_t)text_len;
+
+                uint32_t u_enc_ctr = s_tx_seq;
+                frame[4] = (uint8_t)(u_enc_ctr      );
+                frame[5] = (uint8_t)(u_enc_ctr >>  8);
+                frame[6] = (uint8_t)(u_enc_ctr >> 16);
+                frame[7] = (uint8_t)(u_enc_ctr >> 24);
+
+                aes_crypt(&frame[FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN],
+                          (const uint8_t *)text, (size_t)text_len,
+                          s_node_id, u_enc_ctr);
+                size_t frame_len = FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN + (size_t)text_len;
 
                 (void)dedup_check_and_record(s_node_id, (uint8_t)s_tx_seq);
 
@@ -783,6 +906,7 @@ void app_main(void)
     nvs_init_safe();
     init_node_id();
     seq_persist_init();
+    aes_init_safe();
     ESP_LOGI(TAG, "role: %s (low_power=%d, forwards=%d, originates=%d)",
              role_name(), ROLE_LOW_POWER, ROLE_FORWARDS, ROLE_ORIGINATES);
 
