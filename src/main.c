@@ -69,6 +69,10 @@
 #include "mbedtls/aes.h"
 #include "mbedtls/sha256.h"
 
+#ifdef ENABLE_LIGHT_SLEEP
+#include "esp_pm.h"
+#endif
+
 #include "sx1262.h"
 #include "ssd1306.h"
 
@@ -952,6 +956,29 @@ void app_main(void)
     seq_persist_init();
     init_channel_hash();
     aes_init_safe();
+
+#ifdef ENABLE_LIGHT_SLEEP
+    /* Light sleep via the IDF PM framework. The kernel automatically
+     * light-sleeps the CPU when no task is runnable AND no driver holds
+     * a no-sleep lock. DIO1 wakes the CPU on RX/TX events. */
+    {
+        esp_pm_config_t pm_cfg = {
+            .max_freq_mhz = 240,
+            .min_freq_mhz = 80,
+            .light_sleep_enable = true,
+        };
+        esp_err_t err = esp_pm_configure(&pm_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "esp_pm_configure failed (%s)", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "light sleep enabled (CPU %d-%d MHz)",
+                     pm_cfg.min_freq_mhz, pm_cfg.max_freq_mhz);
+        }
+        if (sx1262_enable_dio1_wake() != SX1262_OK) {
+            ESP_LOGW(TAG, "DIO1 wake setup failed; CPU may not wake on RX");
+        }
+    }
+#endif
     ESP_LOGI(TAG, "role: %s (low_power=%d, forwards=%d, originates=%d)",
              role_name(), ROLE_LOW_POWER, ROLE_FORWARDS, ROLE_ORIGINATES);
 

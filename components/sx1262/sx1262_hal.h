@@ -53,3 +53,8 @@ bool sx1262_hal_wait_dio1(TickType_t timeout);
  * (tWAKE ≈ 5 ms per DS) before returning so the caller can issue
  * commands immediately. No SPI bytes are sent. */
 sx1262_status_t sx1262_hal_wake_pulse(void);
+
+/* Configure DIO1 as a level-based wake source from ESP32 light sleep.
+ * Coexists with the rising-edge ISR: the level wake brings the CPU up;
+ * the GPIO peripheral's queued edge fires the ISR after wake. */
+sx1262_status_t sx1262_hal_enable_dio1_wake(void);

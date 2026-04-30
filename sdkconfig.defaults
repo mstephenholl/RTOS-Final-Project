@@ -19,3 +19,11 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
 # ---- Flash --------------------------------------------------------------
 # Heltec V3 ships with 8MB flash.
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# ---- Power management ---------------------------------------------------
+# Compile in PM framework. Driver-level locks (SPI/I2C/UART hold a
+# no-sleep lock while bus traffic is in flight) become real instead of
+# no-ops. Tiny overhead when unused; required for litesleep build.
+CONFIG_PM_ENABLE=y
+# Allow FreeRTOS to skip ticks during idle. Required for light sleep.
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y

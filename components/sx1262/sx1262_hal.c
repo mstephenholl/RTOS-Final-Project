@@ -21,6 +21,7 @@
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
+#include "esp_sleep.h"
 
 static const char *TAG = "sx1262_hal";
 
@@ -279,4 +280,22 @@ sx1262_status_t sx1262_hal_wake_pulse(void)
     gpio_set_level(SX1262_PIN_NSS, 1);
     /* tWAKE up to ~5 ms; allow margin. */
     return sx1262_hal_wait_busy(20);
+}
+
+sx1262_status_t sx1262_hal_enable_dio1_wake(void)
+{
+    /* GPIO wake from light sleep is level-based (the edge ISR is separate
+     * and continues to fire on rising-edge — the GPIO peripheral remembers
+     * the edge across the sleep boundary so the ISR runs after wake). */
+    esp_err_t err = gpio_wakeup_enable(SX1262_PIN_DIO1, GPIO_INTR_HIGH_LEVEL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "gpio_wakeup_enable failed (%d)", err);
+        return SX1262_ERR_HW;
+    }
+    err = esp_sleep_enable_gpio_wakeup();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_sleep_enable_gpio_wakeup failed (%d)", err);
+        return SX1262_ERR_HW;
+    }
+    return SX1262_OK;
 }

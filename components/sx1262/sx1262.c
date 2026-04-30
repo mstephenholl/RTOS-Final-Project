@@ -362,6 +362,11 @@ sx1262_status_t sx1262_wake(void)
     return sx1262_hal_wake_pulse();
 }
 
+sx1262_status_t sx1262_enable_dio1_wake(void)
+{
+    return sx1262_hal_enable_dio1_wake();
+}
+
 /* ---------------------------------------------------------------------- */
 /*  TX / RX execution (runs only inside sx1262_run)                       */
 /* ---------------------------------------------------------------------- */

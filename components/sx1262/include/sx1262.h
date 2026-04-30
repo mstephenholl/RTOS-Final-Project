@@ -79,3 +79,8 @@ sx1262_status_t sx1262_sleep(bool warm);
  * needed). After COLD sleep, configuration is gone — call sx1262_init()
  * before resuming. */
 sx1262_status_t sx1262_wake(void);
+
+/* Configure DIO1 to wake the ESP32 from light sleep. Call once at boot if
+ * using ESP-side power management. The driver's normal edge ISR continues
+ * to function alongside this. */
+sx1262_status_t sx1262_enable_dio1_wake(void);
