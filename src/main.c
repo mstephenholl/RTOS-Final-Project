@@ -64,6 +64,8 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_random.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 #include "sx1262.h"
 #include "ssd1306.h"
@@ -146,9 +148,76 @@ static uint32_t s_rx_count = 0;
 
 /* ---------------- Identity ---------------- */
 
-static uint8_t s_node_id      = 0;
-static uint8_t s_tx_seq       = 0;
-static uint8_t s_last_seen_id = 0;   /* for choosing a unicast peer */
+/* s_tx_seq is uint32_t internally so persistence math doesn't wrap; the
+ * wire format remains uint8_t (cast at frame-write time), which is what
+ * the dedup layer expects. */
+static uint8_t  s_node_id      = 0;
+static uint32_t s_tx_seq       = 0;
+static uint8_t  s_last_seen_id = 0;   /* for choosing a unicast peer */
+
+/* ---------------- NVS-persisted seq counter ---------------- */
+
+#define SEQ_PERSIST_INTERVAL  32        /* commit a "future" value every N TXs */
+#define NVS_NS                "mesh"
+#define NVS_KEY_TX_SEQ        "tx_seq"
+
+static uint32_t s_seq_persistent = 0;
+
+static void nvs_init_safe(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS init: erasing partition (%s)", esp_err_to_name(err));
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+}
+
+/* "Future commit" pattern: NVS always contains a value > any seq we've sent.
+ * On boot we restore that and reserve another batch. Cuts flash writes by
+ * SEQ_PERSIST_INTERVAL× compared to write-per-TX, at the cost of "burning"
+ * up to N-1 seqs across each reboot (no replay risk). */
+static void seq_persist_init(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_open failed (%s); seq starts at 0",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    uint32_t restored = 0;
+    err = nvs_get_u32(h, NVS_KEY_TX_SEQ, &restored);
+    if (err == ESP_OK) {
+        s_tx_seq = restored;
+        ESP_LOGI(TAG, "restored s_tx_seq=%lu from NVS", (unsigned long)restored);
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "nvs_get_u32: %s", esp_err_to_name(err));
+    }
+
+    /* Reserve next batch. */
+    s_seq_persistent = s_tx_seq + SEQ_PERSIST_INTERVAL;
+    nvs_set_u32(h, NVS_KEY_TX_SEQ, s_seq_persistent);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void seq_persist_advance(void)
+{
+    s_tx_seq++;
+    if (s_tx_seq < s_seq_persistent) return;
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    s_seq_persistent = s_tx_seq + SEQ_PERSIST_INTERVAL;
+    nvs_set_u32(h, NVS_KEY_TX_SEQ, s_seq_persistent);
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "seq batch reserved up to %lu",
+             (unsigned long)s_seq_persistent);
+}
 
 static void init_node_id(void)
 {
@@ -389,19 +458,20 @@ static void ack_send(uint8_t orig_src, uint8_t orig_seq)
 {
     uint8_t frame[FRAME_HEADER_LEN + 1];
     frame[0] = s_node_id;
-    frame[1] = s_tx_seq;
+    frame[1] = (uint8_t)s_tx_seq;
     frame[2] = orig_src;
     frame[3] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT) | HOP_FLAGS_IS_ACK;
     frame[4] = orig_seq;
 
     /* Pre-record so neighbor forwards of our own ACK get dropped on return. */
-    (void)dedup_check_and_record(s_node_id, s_tx_seq);
+    (void)dedup_check_and_record(s_node_id, (uint8_t)s_tx_seq);
 
     sx1262_status_t s = sx1262_send(frame, sizeof(frame), pdMS_TO_TICKS(2000));
     if (s == SX1262_OK) {
         ESP_LOGI(TAG, "ACK TX: src=%02X seq=%u dst=%02X (acks #%02X seq %u)",
-                 s_node_id, s_tx_seq, orig_src, orig_src, orig_seq);
-        s_tx_seq++;
+                 s_node_id, (unsigned)(s_tx_seq & 0xFFu), orig_src,
+                 orig_src, orig_seq);
+        seq_persist_advance();
     } else {
         ESP_LOGW(TAG, "ACK enqueue failed (status %d)", s);
     }
@@ -626,19 +696,20 @@ static void app_task(void *arg)
             if (text_len < 0) text_len = 0;
 
             frame[0] = s_node_id;
-            frame[1] = s_tx_seq;
+            frame[1] = (uint8_t)s_tx_seq;
             frame[2] = MESH_BROADCAST;
             frame[3] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT);
             memcpy(&frame[FRAME_HEADER_LEN], text, (size_t)text_len);
             size_t frame_len = FRAME_HEADER_LEN + (size_t)text_len;
 
-            (void)dedup_check_and_record(s_node_id, s_tx_seq);
+            (void)dedup_check_and_record(s_node_id, (uint8_t)s_tx_seq);
 
             sx1262_status_t s = sx1262_send(frame, frame_len, pdMS_TO_TICKS(2000));
             if (s == SX1262_OK) {
                 ESP_LOGI(TAG, "TX bcast: src=%02X seq=%u dst=ALL ttl=%u \"%s\"",
-                         s_node_id, s_tx_seq, MESH_TTL_DEFAULT, text);
-                s_tx_seq++;
+                         s_node_id, (unsigned)(s_tx_seq & 0xFFu),
+                         MESH_TTL_DEFAULT, text);
+                seq_persist_advance();
                 ssd1306_printf(0, 3, "TX: %04lu  ID:%02X",
                                (unsigned long)(n + 1), s_node_id);
                 ssd1306_flush();
@@ -660,22 +731,24 @@ static void app_task(void *arg)
                 if (text_len < 0) text_len = 0;
 
                 frame[0] = s_node_id;
-                frame[1] = s_tx_seq;
+                frame[1] = (uint8_t)s_tx_seq;
                 frame[2] = s_last_seen_id;
                 frame[3] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT)
                          | HOP_FLAGS_WANTS_ACK;
                 memcpy(&frame[FRAME_HEADER_LEN], text, (size_t)text_len);
                 size_t frame_len = FRAME_HEADER_LEN + (size_t)text_len;
 
-                (void)dedup_check_and_record(s_node_id, s_tx_seq);
+                (void)dedup_check_and_record(s_node_id, (uint8_t)s_tx_seq);
 
                 sx1262_status_t s = sx1262_send(frame, frame_len, pdMS_TO_TICKS(2000));
                 if (s == SX1262_OK) {
                     ESP_LOGI(TAG, "TX unicast: src=%02X seq=%u dst=%02X "
                              "wants_ack \"%s\"",
-                             s_node_id, s_tx_seq, s_last_seen_id, text);
-                    ack_pending_add(frame, frame_len, s_last_seen_id, s_tx_seq);
-                    s_tx_seq++;
+                             s_node_id, (unsigned)(s_tx_seq & 0xFFu),
+                             s_last_seen_id, text);
+                    ack_pending_add(frame, frame_len, s_last_seen_id,
+                                    (uint8_t)s_tx_seq);
+                    seq_persist_advance();
                     ping_n++;
                 } else {
                     ESP_LOGW(TAG, "Unicast TX enqueue failed (status %d)", s);
@@ -707,7 +780,9 @@ static void app_task(void *arg)
 
 void app_main(void)
 {
+    nvs_init_safe();
     init_node_id();
+    seq_persist_init();
     ESP_LOGI(TAG, "role: %s (low_power=%d, forwards=%d, originates=%d)",
              role_name(), ROLE_LOW_POWER, ROLE_FORWARDS, ROLE_ORIGINATES);
 
