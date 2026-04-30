@@ -67,6 +67,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "mbedtls/aes.h"
+#include "mbedtls/sha256.h"
 
 #include "sx1262.h"
 #include "ssd1306.h"
@@ -113,13 +114,23 @@ static const char *role_name(void)
     }
 }
 
-/* ---------------- Frame format ---------------- */
+/* ---------------- Frame format ----------------
+ *
+ * Wire layout:
+ *   byte 0   : channel_hash (low byte of SHA-256(CHANNEL_NAME))
+ *   byte 1   : src_id
+ *   byte 2   : seq
+ *   byte 3   : dst_id
+ *   byte 4   : hop_flags
+ *   bytes 5-8: enc_counter (u32 LE) — plaintext, used as AES nonce input
+ *   bytes 9+ : AES-CTR-encrypted body
+ */
 
-#define FRAME_HEADER_LEN          4
+#define FRAME_HEADER_LEN          5    /* chan_hash + 4-byte routing header */
 #define FRAME_ENC_PREFIX_LEN      4    /* enc_counter (u32 LE), plaintext */
 #define FRAME_WIRE_MAX            255  /* SX1262 max LoRa payload */
 #define FRAME_BODY_MAX            (FRAME_WIRE_MAX - FRAME_HEADER_LEN - FRAME_ENC_PREFIX_LEN)
-                                  /* = 247: max plaintext body length */
+                                  /* = 246: max plaintext body length */
 
 #define HOP_FLAGS_TTL_SHIFT       4
 #define HOP_FLAGS_TTL_MASK        0xF0u
@@ -240,6 +251,26 @@ static void init_node_id(void)
     /* Reserve 0xFF for broadcast addressing. */
     if (s_node_id == MESH_BROADCAST) s_node_id = 0xFE;
     ESP_LOGI(TAG, "node ID: 0x%02X", s_node_id);
+}
+
+/* ---------------- Channel hash (early filter) ---------------- */
+
+#define CHANNEL_NAME "rtos-final-project"
+
+static uint8_t s_channel_hash;
+
+static void init_channel_hash(void)
+{
+    uint8_t digest[32];
+    int ret = mbedtls_sha256((const uint8_t *)CHANNEL_NAME,
+                             strlen(CHANNEL_NAME), digest, 0);
+    if (ret != 0) {
+        ESP_LOGW(TAG, "mbedtls_sha256 failed (%d); using fallback hash", ret);
+        s_channel_hash = 0xC0;
+        return;
+    }
+    s_channel_hash = digest[0];
+    ESP_LOGI(TAG, "channel hash: 0x%02X (\"%s\")", s_channel_hash, CHANNEL_NAME);
 }
 
 /* ---------------- Channel encryption (AES-128-CTR) ---------------- */
@@ -381,11 +412,12 @@ static bool forward_schedule(const rx_event_t *evt)
                       | (new_ttl << HOP_FLAGS_TTL_SHIFT)
                       | HOP_FLAGS_IS_FORWARDED;
 
-    /* Header — TTL decremented and IS_FORWARDED set. */
-    f->frame[0] = evt->src_id;
-    f->frame[1] = evt->seq;
-    f->frame[2] = evt->dst_id;
-    f->frame[3] = new_flags;
+    /* Header — chan_hash, then TTL-decremented routing fields. */
+    f->frame[0] = s_channel_hash;
+    f->frame[1] = evt->src_id;
+    f->frame[2] = evt->seq;
+    f->frame[3] = evt->dst_id;
+    f->frame[4] = new_flags;
 
     /* Plaintext enc_counter prefix — same value the originator used so any
      * receiver can reproduce the nonce. */
@@ -533,16 +565,17 @@ static TickType_t ack_next_deadline(TickType_t fallback)
 static void ack_send(uint8_t orig_src, uint8_t orig_seq)
 {
     uint8_t frame[FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN + 1];
-    frame[0] = s_node_id;
-    frame[1] = (uint8_t)s_tx_seq;
-    frame[2] = orig_src;
-    frame[3] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT) | HOP_FLAGS_IS_ACK;
+    frame[0] = s_channel_hash;
+    frame[1] = s_node_id;
+    frame[2] = (uint8_t)s_tx_seq;
+    frame[3] = orig_src;
+    frame[4] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT) | HOP_FLAGS_IS_ACK;
 
     uint32_t enc_ctr = s_tx_seq;
-    frame[4] = (uint8_t)(enc_ctr      );
-    frame[5] = (uint8_t)(enc_ctr >>  8);
-    frame[6] = (uint8_t)(enc_ctr >> 16);
-    frame[7] = (uint8_t)(enc_ctr >> 24);
+    frame[FRAME_HEADER_LEN + 0] = (uint8_t)(enc_ctr      );
+    frame[FRAME_HEADER_LEN + 1] = (uint8_t)(enc_ctr >>  8);
+    frame[FRAME_HEADER_LEN + 2] = (uint8_t)(enc_ctr >> 16);
+    frame[FRAME_HEADER_LEN + 3] = (uint8_t)(enc_ctr >> 24);
 
     /* Encrypt the 1-byte body in place. */
     uint8_t plaintext_body = orig_seq;
@@ -586,15 +619,24 @@ static void on_rx_packet(const uint8_t *data, size_t len, int8_t rssi, int8_t sn
         return;
     }
 
-    uint8_t src_id    = data[0];
-    uint8_t seq       = data[1];
-    uint8_t dst_id    = data[2];
-    uint8_t hop_flags = data[3];
+    /* Channel-hash filter: drop packets that aren't on our channel before
+     * doing any AES work. Also catches accidental noise frames from CRC
+     * collisions, which would have bogus first bytes. */
+    if (data[0] != s_channel_hash) {
+        ESP_LOGD(TAG, "wrong channel: got 0x%02X, want 0x%02X — dropped",
+                 data[0], s_channel_hash);
+        return;
+    }
 
-    uint32_t enc_counter = (uint32_t)data[4]
-                         | ((uint32_t)data[5] <<  8)
-                         | ((uint32_t)data[6] << 16)
-                         | ((uint32_t)data[7] << 24);
+    uint8_t src_id    = data[1];
+    uint8_t seq       = data[2];
+    uint8_t dst_id    = data[3];
+    uint8_t hop_flags = data[4];
+
+    uint32_t enc_counter = (uint32_t)data[5]
+                         | ((uint32_t)data[6] <<  8)
+                         | ((uint32_t)data[7] << 16)
+                         | ((uint32_t)data[8] << 24);
 
     const uint8_t *enc_body = &data[FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN];
     size_t body_len = len - FRAME_HEADER_LEN - FRAME_ENC_PREFIX_LEN;
@@ -800,16 +842,17 @@ static void app_task(void *arg)
                                     "hello from heltec v3 #%lu", (unsigned long)n);
             if (text_len < 0) text_len = 0;
 
-            frame[0] = s_node_id;
-            frame[1] = (uint8_t)s_tx_seq;
-            frame[2] = MESH_BROADCAST;
-            frame[3] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT);
+            frame[0] = s_channel_hash;
+            frame[1] = s_node_id;
+            frame[2] = (uint8_t)s_tx_seq;
+            frame[3] = MESH_BROADCAST;
+            frame[4] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT);
 
             uint32_t enc_ctr = s_tx_seq;
-            frame[4] = (uint8_t)(enc_ctr      );
-            frame[5] = (uint8_t)(enc_ctr >>  8);
-            frame[6] = (uint8_t)(enc_ctr >> 16);
-            frame[7] = (uint8_t)(enc_ctr >> 24);
+            frame[FRAME_HEADER_LEN + 0] = (uint8_t)(enc_ctr      );
+            frame[FRAME_HEADER_LEN + 1] = (uint8_t)(enc_ctr >>  8);
+            frame[FRAME_HEADER_LEN + 2] = (uint8_t)(enc_ctr >> 16);
+            frame[FRAME_HEADER_LEN + 3] = (uint8_t)(enc_ctr >> 24);
 
             aes_crypt(&frame[FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN],
                       (const uint8_t *)text, (size_t)text_len,
@@ -844,17 +887,18 @@ static void app_task(void *arg)
                                         (unsigned long)ping_n, s_last_seen_id);
                 if (text_len < 0) text_len = 0;
 
-                frame[0] = s_node_id;
-                frame[1] = (uint8_t)s_tx_seq;
-                frame[2] = s_last_seen_id;
-                frame[3] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT)
+                frame[0] = s_channel_hash;
+                frame[1] = s_node_id;
+                frame[2] = (uint8_t)s_tx_seq;
+                frame[3] = s_last_seen_id;
+                frame[4] = (MESH_TTL_DEFAULT << HOP_FLAGS_TTL_SHIFT)
                          | HOP_FLAGS_WANTS_ACK;
 
                 uint32_t u_enc_ctr = s_tx_seq;
-                frame[4] = (uint8_t)(u_enc_ctr      );
-                frame[5] = (uint8_t)(u_enc_ctr >>  8);
-                frame[6] = (uint8_t)(u_enc_ctr >> 16);
-                frame[7] = (uint8_t)(u_enc_ctr >> 24);
+                frame[FRAME_HEADER_LEN + 0] = (uint8_t)(u_enc_ctr      );
+                frame[FRAME_HEADER_LEN + 1] = (uint8_t)(u_enc_ctr >>  8);
+                frame[FRAME_HEADER_LEN + 2] = (uint8_t)(u_enc_ctr >> 16);
+                frame[FRAME_HEADER_LEN + 3] = (uint8_t)(u_enc_ctr >> 24);
 
                 aes_crypt(&frame[FRAME_HEADER_LEN + FRAME_ENC_PREFIX_LEN],
                           (const uint8_t *)text, (size_t)text_len,
@@ -906,6 +950,7 @@ void app_main(void)
     nvs_init_safe();
     init_node_id();
     seq_persist_init();
+    init_channel_hash();
     aes_init_safe();
     ESP_LOGI(TAG, "role: %s (low_power=%d, forwards=%d, originates=%d)",
              role_name(), ROLE_LOW_POWER, ROLE_FORWARDS, ROLE_ORIGINATES);
