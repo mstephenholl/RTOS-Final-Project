@@ -1060,6 +1060,92 @@ sleep:
 
 #endif  /* ENABLE_DEEP_SLEEP */
 
+/* ---------------- Synthetic RX injector (instrumentation-only) ----------------
+ *
+ * Posts fake rx_event_t to s_rx_events at a fixed rate so we can stress the
+ * RX -> parse path on a single board, without a peer. Frames look exactly
+ * like what on_rx_packet would produce: same struct, same queue, same
+ * downstream dispatch via handle_rx_event. The mesh state machine cannot
+ * tell injected events from radio events.
+ *
+ * Knobs (compile-time, edit and reflash):
+ *   INJECTOR_RATE_HZ  - 0 disables; 1..50 sweeps the interesting region.
+ *   INJECTOR_BODY_LEN - bytes of body. Mostly affects render + memcpy cost
+ *                       (we skip AES, since these are pre-decrypted plaintext).
+ *   INJECTOR_TTL      - 0 skips forward_schedule; >0 exercises fwd_drop AND
+ *                       puts real TX on air (forward task will retransmit).
+ *
+ * Priority tradeoff: runs at priority 6 (above load_a/b/c) so the actual
+ * inject rate stays close to INJECTOR_RATE_HZ even under heavy CPU load.
+ * The cost is ~50us/sec of CPU at 50 Hz — negligible vs. the load tasks.
+ *
+ * src_id is fixed at 0x42 with an 8-bit seq counter that wraps every 256
+ * events. With a 30 s dedup TTL, sustained rates >= 9 Hz will eventually
+ * trigger dedup-suppression of forward_schedule / render. The rx_drop and
+ * parse_latency metrics are unaffected (those gate before dedup); the
+ * forward path becomes a less reliable signal at high rates. */
+
+#ifdef ENABLE_INSTRUMENTATION
+
+#define INJECTOR_RATE_HZ      0     /* 0 disables. Try 5, 10, 20, 50. */
+#define INJECTOR_BODY_LEN     23
+#define INJECTOR_TTL          0     /* 0 = no forward; >0 to stress fwd queue */
+#define INJECTOR_SRC_ID       0x42
+#define INJECTOR_RSSI         -80
+#define INJECTOR_SNR          5
+
+static void injector_task(void *arg)
+{
+    (void)arg;
+
+    if (INJECTOR_RATE_HZ == 0) {
+        ESP_LOGI(TAG, "injector disabled (INJECTOR_RATE_HZ=0)");
+        vTaskDelete(NULL);
+    }
+
+    TickType_t period_ticks = pdMS_TO_TICKS(1000 / INJECTOR_RATE_HZ);
+    if (period_ticks < 1) period_ticks = 1;
+
+    uint8_t  inj_seq   = 0;
+    uint32_t inj_count = 0;
+    TickType_t next = xTaskGetTickCount();
+
+    ESP_LOGI(TAG, "injector running: %d Hz, src=0x%02X, ttl=%d, body=%d B",
+             INJECTOR_RATE_HZ, INJECTOR_SRC_ID, INJECTOR_TTL, INJECTOR_BODY_LEN);
+
+    for (;;) {
+        rx_event_t evt = {
+            .len            = INJECTOR_BODY_LEN,
+            .src_id         = INJECTOR_SRC_ID,
+            .seq            = inj_seq++,
+            .dst_id         = MESH_BROADCAST,
+            .hop_flags      = (INJECTOR_TTL << HOP_FLAGS_TTL_SHIFT),
+            .rssi           = INJECTOR_RSSI,
+            .snr            = INJECTOR_SNR,
+            .count          = ++inj_count,
+            .enc_counter    = inj_count,
+            .ts_enqueued_us = esp_timer_get_time(),
+        };
+
+        /* Body: "inj NNNNNN" padded out to INJECTOR_BODY_LEN. */
+        int written = snprintf((char *)evt.data, sizeof(evt.data),
+                               "inj %lu", (unsigned long)inj_count);
+        if (written < 0) written = 0;
+        for (int i = written; i < INJECTOR_BODY_LEN && i < (int)sizeof(evt.data); i++) {
+            evt.data[i] = ' ';
+        }
+
+        instr_radio_log_rx_received();
+        if (xQueueSend(s_rx_events, &evt, 0) != pdTRUE) {
+            instr_radio_log_rx_drop();
+        }
+
+        vTaskDelayUntil(&next, period_ticks);
+    }
+}
+
+#endif  /* ENABLE_INSTRUMENTATION */
+
 void app_main(void)
 {
     nvs_init_safe();
@@ -1125,4 +1211,10 @@ void app_main(void)
     configASSERT(ok == pdPASS);
 
     instr_start_load_tasks();
+
+#ifdef ENABLE_INSTRUMENTATION
+    BaseType_t inj_ok = xTaskCreate(injector_task, "injector",
+                                    3072, NULL, 6, NULL);
+    configASSERT(inj_ok == pdPASS);
+#endif
 }
