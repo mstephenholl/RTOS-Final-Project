@@ -615,6 +615,7 @@ static void on_tx_complete(sx1262_status_t status, size_t len)
         ESP_LOGW(TAG, "TX air-side failure (status %d, %u B)", status, (unsigned)len);
     }
     instr_log(INSTR_EVT_TX_DONE, INSTR_TASK_LORA, (uint32_t)len);
+    instr_gpio_pulse(INSTR_GPIO_LORA_TX);
 }
 
 /* ---------------- RX path ---------------- */
@@ -691,6 +692,7 @@ static void on_rx_packet(const uint8_t *data, size_t len, int8_t rssi, int8_t sn
                  (unsigned long)s_rx_count);
     }
     instr_log(INSTR_EVT_RX, INSTR_TASK_LORA, ((uint32_t)src_id << 8) | seq);
+    instr_gpio_pulse(INSTR_GPIO_LORA_RX);
 }
 
 /* ---------------- OLED render ---------------- */

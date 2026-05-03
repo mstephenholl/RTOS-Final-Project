@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "driver/gpio.h"
 
 static const char *TAG = "instr";
@@ -55,6 +56,13 @@ void instr_log(uint16_t event_id, uint16_t task_id, uint32_t param)
 void instr_gpio_set(int pin, int level)
 {
     gpio_set_level(pin, level);
+}
+
+void instr_gpio_pulse(int pin)
+{
+    gpio_set_level(pin, 1);
+    esp_rom_delay_us(5);
+    gpio_set_level(pin, 0);
 }
 
 /* ---- Synthetic load tasks ----
@@ -203,7 +211,9 @@ esp_err_t instr_init(void)
         .pin_bit_mask = (1ULL << INSTR_GPIO_APP)
                       | (1ULL << INSTR_GPIO_LOAD_A)
                       | (1ULL << INSTR_GPIO_LOAD_B)
-                      | (1ULL << INSTR_GPIO_LOAD_C),
+                      | (1ULL << INSTR_GPIO_LOAD_C)
+                      | (1ULL << INSTR_GPIO_LORA_TX)
+                      | (1ULL << INSTR_GPIO_LORA_RX),
         .mode         = GPIO_MODE_OUTPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
