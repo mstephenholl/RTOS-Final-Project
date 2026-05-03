@@ -58,6 +58,13 @@
 #define INSTR_GPIO_LORA_TX  6
 #define INSTR_GPIO_LORA_RX  7
 
+/* ---- Synthetic injector identification ----
+ * Synthetic frames carry src_id = INSTR_INJECTOR_SRC_ID. handle_rx_event
+ * uses this to skip OLED render (which would otherwise dominate at high
+ * inject rates) — the injector is purely a stress driver, not real traffic
+ * worth displaying. */
+#define INSTR_INJECTOR_SRC_ID  0x42
+
 #ifdef ENABLE_INSTRUMENTATION
 
 /* Configure GPIOs, spawn the timeline-dumper and stats-reporter tasks.
@@ -102,6 +109,11 @@ void instr_radio_log_tx_fail(void);
 void instr_radio_log_fwd_drop(void);
 void instr_radio_log_parse_latency(int64_t latency_us);
 
+/* Time spent inside render_rx_event() — the OLED I2C flush is the main
+ * suspect for parse-latency spikes. Compare avg render duration against
+ * avg parse latency to see how much of the latter is blocking-on-OLED. */
+void instr_radio_log_render_us(int64_t duration_us);
+
 #else  /* !ENABLE_INSTRUMENTATION */
 
 static inline esp_err_t instr_init(void) { return 0; }
@@ -117,5 +129,6 @@ static inline void instr_radio_log_tx_originated(void) { }
 static inline void instr_radio_log_tx_fail(void) { }
 static inline void instr_radio_log_fwd_drop(void) { }
 static inline void instr_radio_log_parse_latency(int64_t latency_us) { (void)latency_us; }
+static inline void instr_radio_log_render_us(int64_t duration_us) { (void)duration_us; }
 
 #endif  /* ENABLE_INSTRUMENTATION */

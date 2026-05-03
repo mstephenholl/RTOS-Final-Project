@@ -199,6 +199,10 @@ static struct {
     uint32_t parse_latency_count;
     int64_t  parse_latency_total_us;
     int64_t  parse_latency_max_us;
+
+    uint32_t render_count;
+    int64_t  render_total_us;
+    int64_t  render_max_us;
 } s_radio;
 
 void instr_radio_log_rx_received(void)   { s_radio.rx_received++; }
@@ -213,6 +217,15 @@ void instr_radio_log_parse_latency(int64_t latency_us)
     s_radio.parse_latency_total_us += latency_us;
     if (latency_us > s_radio.parse_latency_max_us) {
         s_radio.parse_latency_max_us = latency_us;
+    }
+}
+
+void instr_radio_log_render_us(int64_t duration_us)
+{
+    s_radio.render_count++;
+    s_radio.render_total_us += duration_us;
+    if (duration_us > s_radio.render_max_us) {
+        s_radio.render_max_us = duration_us;
     }
 }
 
@@ -282,6 +295,14 @@ static void stats_task(void *arg)
                  (unsigned)s_radio.parse_latency_count,
                  parse_avg_us,
                  s_radio.parse_latency_max_us);
+
+        int64_t render_avg_us = s_radio.render_count > 0
+            ? s_radio.render_total_us / (int64_t)s_radio.render_count
+            : 0;
+        ESP_LOGI(TAG, "       oled render:   n=%u avg=%lldus max=%lldus",
+                 (unsigned)s_radio.render_count,
+                 render_avg_us,
+                 s_radio.render_max_us);
     }
 }
 

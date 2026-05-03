@@ -114,6 +114,15 @@ typedef enum {
 #define ROLE_FORWARDS     (APP_ROLE != APP_ROLE_LEAF)
 #define ROLE_ORIGINATES   (APP_ROLE != APP_ROLE_GATEWAY)
 
+/* When 1, synthetic injector frames (src_id = INSTR_INJECTOR_SRC_ID) skip
+ * render_rx_event in handle_rx_event. Lets us study the post-OLED bottleneck
+ * in isolation. Set to 0 to characterize the OLED-bound regime itself.
+ * Defined here (not next to the other injector knobs) because it's referenced
+ * by handle_rx_event, which appears before the injector block in source order. */
+#ifdef ENABLE_INSTRUMENTATION
+#define INJECTOR_BYPASS_OLED  1
+#endif
+
 static const char *role_name(void)
 {
     switch (APP_ROLE) {
@@ -758,9 +767,20 @@ static void handle_rx_event(const rx_event_t *evt)
         return;
     }
 
-    /* (4) Local delivery (don't render ACKs — they're protocol traffic). */
+    /* (4) Local delivery (don't render ACKs — they're protocol traffic).
+     *     Synthetic injector frames bypass render when INJECTOR_BYPASS_OLED=1:
+     *     at high inject rates the OLED I2C flush (~39 ms) dominates app_task
+     *     and confounds the RX-path measurement we're actually trying to make. */
     bool for_us = (evt->dst_id == s_node_id) || (evt->dst_id == MESH_BROADCAST);
-    if (for_us && !is_ack) render_rx_event(evt);
+    bool is_synthetic = false;
+#if defined(ENABLE_INSTRUMENTATION) && INJECTOR_BYPASS_OLED
+    is_synthetic = (evt->src_id == INSTR_INJECTOR_SRC_ID);
+#endif
+    if (for_us && !is_ack && !is_synthetic) {
+        int64_t t_render_start = esp_timer_get_time();
+        render_rx_event(evt);
+        instr_radio_log_render_us(esp_timer_get_time() - t_render_start);
+    }
 
     /* (5) Forwarding for anything not solely addressed to us. LEAF role
      *     never forwards — sleeping nodes can't reliably relay, and the
@@ -1090,7 +1110,6 @@ sleep:
 #define INJECTOR_RATE_HZ      0     /* 0 disables. Try 5, 10, 20, 50. */
 #define INJECTOR_BODY_LEN     23
 #define INJECTOR_TTL          0     /* 0 = no forward; >0 to stress fwd queue */
-#define INJECTOR_SRC_ID       0x42
 #define INJECTOR_RSSI         -80
 #define INJECTOR_SNR          5
 
@@ -1103,6 +1122,12 @@ static void injector_task(void *arg)
         vTaskDelete(NULL);
     }
 
+    /* Hold off injection until app_task is past its OLED init + 500 ms
+     * settle delay. Otherwise the depth-4 queue fills during boot and the
+     * first dequeued event records a parse latency of ~650 ms that
+     * permanently dominates the max metric. 2 s is comfortable margin. */
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
     TickType_t period_ticks = pdMS_TO_TICKS(1000 / INJECTOR_RATE_HZ);
     if (period_ticks < 1) period_ticks = 1;
 
@@ -1111,12 +1136,12 @@ static void injector_task(void *arg)
     TickType_t next = xTaskGetTickCount();
 
     ESP_LOGI(TAG, "injector running: %d Hz, src=0x%02X, ttl=%d, body=%d B",
-             INJECTOR_RATE_HZ, INJECTOR_SRC_ID, INJECTOR_TTL, INJECTOR_BODY_LEN);
+             INJECTOR_RATE_HZ, INSTR_INJECTOR_SRC_ID, INJECTOR_TTL, INJECTOR_BODY_LEN);
 
     for (;;) {
         rx_event_t evt = {
             .len            = INJECTOR_BODY_LEN,
-            .src_id         = INJECTOR_SRC_ID,
+            .src_id         = INSTR_INJECTOR_SRC_ID,
             .seq            = inj_seq++,
             .dst_id         = MESH_BROADCAST,
             .hop_flags      = (INJECTOR_TTL << HOP_FLAGS_TTL_SHIFT),
