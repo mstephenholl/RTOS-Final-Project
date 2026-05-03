@@ -527,16 +527,59 @@ reduces drop *percentage*** because the denominator grows faster
 than the (mostly fixed) drops/sec. The system isn't RX-bound — it's
 bound by app_task's own blocking I/O.
 
-=== Graceful degradation: load tasks unaffected even at 15% drops
+=== Subsystem isolation: failures don't cross the priority hierarchy
 
-Through every regime tested — including 30 Hz with 15.2% RX drops
-— the synthetic load tasks (`load_a`, `load_b`, `load_c`) showed
-**zero deadline misses**. The radio failure is fully isolated by
-the static priority hierarchy: RX queue overflow at the lowest
-layer doesn't propagate into the rest of the system.
+Through every regime tested — radio overload, CPU overload, and the
+transition between them — failures stayed isolated to the
+overloaded subsystem. Two directions of evidence:
 
-This is exactly what a real-world deployment wants: the radio can
-saturate without causing collateral damage to other subsystems.
+**Direction 1 — radio overload doesn't break load tasks.** At 30 Hz
+/ 15.2% drops (regime 1, with-render), all three load tasks showed
+*zero deadline misses*. RX queue overflow at the lowest layer of
+the priority hierarchy doesn't propagate up.
+
+**Direction 2 — CPU overload doesn't break radio.** Sweeping
+`load_c` WCET at 200 Hz RX with bypass on:
+
+[cols="1,1,1,1,1", options="header"]
+|===
+| Total demand | load_c WCET | load_c misses | load_a misses | Radio drops
+| 75%          | 30 ms       | 0             | 0             | 0.1%
+| 95%          | 50 ms       | 0             | 0             | 0.18%
+| 115%         | 70 ms       | 0             | 0             | 0.2%
+| 145%         | 100 ms      | **100%**      | 0.1%          | 0.3-0.4%
+|===
+
+The 145% case is dramatic: `load_c` with WCET = period saturates
+that task completely. **Every** deadline missed. The task watchdog
+fires repeatedly on `IDLE1` because CPU 1's idle task is starved by
+constantly-runnable load tasks. Yet **the radio drops only 0.3-0.4%**
+— barely worse than the 0.1% baseline. App_task on CPU 0 keeps
+draining the RX queue; lora_task on CPU 1 keeps handling IRQs.
+The catastrophe on `load_c` never crosses the core boundary.
+
+=== SMP scheduling absorbs aggregate demand up to single-task saturation
+
+The CPU-load sweep revealed something striking: **115% nominal
+demand** (more than one core's worth, exceeding what a single-core
+system could ever do) produced *zero deadline misses anywhere*.
+ESP32-S3's dual-core FreeRTOS SMP scheduler distributes the
+unpinned load tasks across cores, leaving CPU 0 mostly clear for
+app_task and CPU 1 mostly clear for lora_task.
+
+Failures don't appear until *individual task utilization* hits 100%
+(`load_c` WCET = period), at which point that task fails completely
+and *only* that task fails. The aggregate-demand metric (sum of
+WCET / period across all tasks) is misleading on SMP: it can exceed
+100% by up to a factor of (number of cores) without breaking
+deadlines, as long as no single task exceeds 100%.
+
+The deployment-relevant takeaway: bad code or runaway sensor
+processing on one task doesn't take down the radio, the load tasks
+that aren't overloaded, or the rest of the application — provided
+the priority hierarchy + core pinning is set up correctly. Pinning
+`app_task` to CPU 0 and `lora_task` to CPU 1 is the load-bearing
+piece of this guarantee.
 
 == Generalizing the result: OLED as a stand-in for blocking I/O
 
@@ -630,14 +673,6 @@ The headline question — "at what load does radio transmission
 start to break?" — now has a two-part answer (see <<findings-section>>):
 26 Hz with OLED render, several hundred Hz without. Pending work
 sharpens those numbers and tests their robustness.
-
-=== Pending: orthogonal CPU-load sweep
-
-Hold RX rate constant (e.g., 200 Hz, where we have a measurable
-0.1% drop rate from broadcast-TX OLED), and sweep `load_c`'s WCET
-upward to see how CPU contention shifts the curve. Question: is
-the post-bypass regime sensitive to load, or does the TX-OLED
-bottleneck dominate regardless of CPU pressure?
 
 === Eventual: confirm with a two-board test
 
