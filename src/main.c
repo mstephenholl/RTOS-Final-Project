@@ -64,6 +64,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "mbedtls/aes.h"
@@ -163,6 +164,8 @@ typedef struct {
     int8_t   snr;
     uint32_t count;                  /* 1-based RX index assigned at reception */
     uint32_t enc_counter;            /* needed to re-encrypt for forwarding */
+    int64_t  ts_enqueued_us;         /* esp_timer_get_time() at enqueue;
+                                      * dequeue side computes parse latency */
 } rx_event_t;
 
 #define RX_EVENT_QUEUE_DEPTH 4
@@ -410,6 +413,7 @@ static bool forward_schedule(const rx_event_t *evt)
         if (!s_fwd_queue[i].valid) { slot = i; break; }
     }
     if (slot < 0) {
+        instr_radio_log_fwd_drop();
         ESP_LOGW(TAG, "fwd queue full — dropping forward of #%02X seq %u",
                  evt->src_id, evt->seq);
         return false;
@@ -675,19 +679,22 @@ static void on_rx_packet(const uint8_t *data, size_t len, int8_t rssi, int8_t sn
              (int)body_len, (const char *)plaintext);
 
     rx_event_t evt = {
-        .len         = (uint8_t)body_len,
-        .src_id      = src_id,
-        .seq         = seq,
-        .dst_id      = dst_id,
-        .hop_flags   = hop_flags,
-        .rssi        = rssi,
-        .snr         = snr,
-        .count       = s_rx_count,
-        .enc_counter = enc_counter,
+        .len            = (uint8_t)body_len,
+        .src_id         = src_id,
+        .seq            = seq,
+        .dst_id         = dst_id,
+        .hop_flags      = hop_flags,
+        .rssi           = rssi,
+        .snr            = snr,
+        .count          = s_rx_count,
+        .enc_counter    = enc_counter,
+        .ts_enqueued_us = esp_timer_get_time(),
     };
     if (body_len > 0) memcpy(evt.data, plaintext, body_len);
 
+    instr_radio_log_rx_received();
     if (xQueueSend(s_rx_events, &evt, 0) != pdTRUE) {
+        instr_radio_log_rx_drop();
         ESP_LOGW(TAG, "rx event queue full — dropping #%lu",
                  (unsigned long)s_rx_count);
     }
@@ -719,6 +726,10 @@ static void render_rx_event(const rx_event_t *evt)
 
 static void handle_rx_event(const rx_event_t *evt)
 {
+    /* Parse latency = time spent sitting in s_rx_events while app_task was
+     * preempted or busy. Grows under load — that's the metric we're after. */
+    instr_radio_log_parse_latency(esp_timer_get_time() - evt->ts_enqueued_us);
+
     bool is_ack    = (evt->hop_flags & HOP_FLAGS_IS_ACK)    != 0;
     bool wants_ack = (evt->hop_flags & HOP_FLAGS_WANTS_ACK) != 0;
     uint8_t ttl = (evt->hop_flags & HOP_FLAGS_TTL_MASK) >> HOP_FLAGS_TTL_SHIFT;
@@ -874,6 +885,7 @@ static void app_task(void *arg)
 
             (void)dedup_check_and_record(s_node_id, (uint8_t)s_tx_seq);
 
+            instr_radio_log_tx_originated();
             sx1262_status_t s = sx1262_send(frame, frame_len, pdMS_TO_TICKS(2000));
             if (s == SX1262_OK) {
                 ESP_LOGI(TAG, "TX bcast: src=%02X seq=%u dst=ALL ttl=%u \"%s\"",
@@ -884,6 +896,7 @@ static void app_task(void *arg)
                                (unsigned long)(n + 1), s_node_id);
                 ssd1306_flush();
             } else {
+                instr_radio_log_tx_fail();
                 ESP_LOGW(TAG, "TX enqueue failed (status %d)", s);
             }
             n++;

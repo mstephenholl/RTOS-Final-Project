@@ -183,11 +183,45 @@ void instr_start_load_tasks(void)
     }
 }
 
+/* ---- Radio path counters ----
+ *
+ * Single-producer per field (see instrumentation.h). 32-bit writes are atomic
+ * on Xtensa; latency_total/max are int64 and only written from app_task, so
+ * stats_task may see slightly torn values for one cycle but the next cycle
+ * will be consistent. No locks — stats are eventually consistent. */
+static struct {
+    uint32_t rx_received;
+    uint32_t rx_drops_queue_full;
+    uint32_t tx_originated;
+    uint32_t tx_drops_enqueue_fail;
+    uint32_t fwd_drops_queue_full;
+
+    uint32_t parse_latency_count;
+    int64_t  parse_latency_total_us;
+    int64_t  parse_latency_max_us;
+} s_radio;
+
+void instr_radio_log_rx_received(void)   { s_radio.rx_received++; }
+void instr_radio_log_rx_drop(void)       { s_radio.rx_drops_queue_full++; }
+void instr_radio_log_tx_originated(void) { s_radio.tx_originated++; }
+void instr_radio_log_tx_fail(void)       { s_radio.tx_drops_enqueue_fail++; }
+void instr_radio_log_fwd_drop(void)      { s_radio.fwd_drops_queue_full++; }
+
+void instr_radio_log_parse_latency(int64_t latency_us)
+{
+    s_radio.parse_latency_count++;
+    s_radio.parse_latency_total_us += latency_us;
+    if (latency_us > s_radio.parse_latency_max_us) {
+        s_radio.parse_latency_max_us = latency_us;
+    }
+}
+
 /* ---- Stats reporter ----
  *
  * Logs an aggregate every 5 s. Per-task: activations, deadline misses, miss
- * percentage, max lateness. Eyeball at-a-glance whether the system is
- * keeping up. */
+ * percentage, max lateness. Plus a radio summary: how many frames came in,
+ * how many dropped at each gate, parse-latency distribution. Eyeball
+ * at-a-glance whether the system is keeping up. */
 
 static void stats_task(void *arg)
 {
@@ -223,6 +257,31 @@ static void stats_task(void *arg)
                      cfg->max_preemption_us,
                      cfg->total_preemption_us);
         }
+
+        /* Radio summary. rx_x10 / tx_x10 are drop rate scaled by 1000 so we
+         * can render a single decimal without floats; e.g., 250 → "25.0%". */
+        uint32_t rx_x10 = s_radio.rx_received > 0
+            ? (s_radio.rx_drops_queue_full * 1000U) / s_radio.rx_received
+            : 0;
+        uint32_t tx_x10 = s_radio.tx_originated > 0
+            ? (s_radio.tx_drops_enqueue_fail * 1000U) / s_radio.tx_originated
+            : 0;
+        int64_t parse_avg_us = s_radio.parse_latency_count > 0
+            ? s_radio.parse_latency_total_us / (int64_t)s_radio.parse_latency_count
+            : 0;
+
+        ESP_LOGI(TAG, "radio: rx=%u (drop %u, %u.%u%%), tx=%u (fail %u, %u.%u%%), fwd_drop=%u",
+                 (unsigned)s_radio.rx_received,
+                 (unsigned)s_radio.rx_drops_queue_full,
+                 (unsigned)(rx_x10 / 10), (unsigned)(rx_x10 % 10),
+                 (unsigned)s_radio.tx_originated,
+                 (unsigned)s_radio.tx_drops_enqueue_fail,
+                 (unsigned)(tx_x10 / 10), (unsigned)(tx_x10 % 10),
+                 (unsigned)s_radio.fwd_drops_queue_full);
+        ESP_LOGI(TAG, "       parse latency: n=%u avg=%lldus max=%lldus",
+                 (unsigned)s_radio.parse_latency_count,
+                 parse_avg_us,
+                 s_radio.parse_latency_max_us);
     }
 }
 

@@ -80,6 +80,28 @@ void instr_gpio_pulse(int pin);
  * instrumentation.c to retune the workload for your experiment. */
 void instr_start_load_tasks(void);
 
+/* ---- Radio path counters ----
+ *
+ * Track how often the radio path drops frames vs. successfully delivers them
+ * across increasing CPU load. The drop sites live in main.c (rx queue full,
+ * forward queue full, sx1262_send enqueue fail); the counters and reporter
+ * live here so the same 5 s stats line shows both load and radio outcomes.
+ *
+ * All increments are single-producer per counter:
+ *   rx_received / rx_drop:    incremented from lora_task (on_rx_packet)
+ *   tx_originated / tx_fail:  incremented from app_task (broadcast send path)
+ *   fwd_drop:                 incremented from app_task (forward_schedule)
+ *   parse_latency:            incremented from app_task (handle_rx_event)
+ *
+ * 32-bit aligned writes are atomic on Xtensa, and stats_task reads are
+ * eventually consistent — no locking needed. */
+void instr_radio_log_rx_received(void);
+void instr_radio_log_rx_drop(void);
+void instr_radio_log_tx_originated(void);
+void instr_radio_log_tx_fail(void);
+void instr_radio_log_fwd_drop(void);
+void instr_radio_log_parse_latency(int64_t latency_us);
+
 #else  /* !ENABLE_INSTRUMENTATION */
 
 static inline esp_err_t instr_init(void) { return 0; }
@@ -89,5 +111,11 @@ static inline void instr_gpio_set(int pin, int level)
     { (void)pin; (void)level; }
 static inline void instr_gpio_pulse(int pin) { (void)pin; }
 static inline void instr_start_load_tasks(void) { }
+static inline void instr_radio_log_rx_received(void) { }
+static inline void instr_radio_log_rx_drop(void) { }
+static inline void instr_radio_log_tx_originated(void) { }
+static inline void instr_radio_log_tx_fail(void) { }
+static inline void instr_radio_log_fwd_drop(void) { }
+static inline void instr_radio_log_parse_latency(int64_t latency_us) { (void)latency_us; }
 
 #endif  /* ENABLE_INSTRUMENTATION */
