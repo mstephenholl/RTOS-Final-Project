@@ -191,6 +191,7 @@ static uint32_t s_rx_count = 0;
 static uint8_t  s_node_id      = 0;
 static uint32_t s_tx_seq       = 0;
 static uint8_t  s_last_seen_id = 0;   /* for choosing a unicast peer */
+static char     s_mac_str[18]  = {0}; /* "AA:BB:CC:DD:EE:FF\0" */
 
 /* ---------------- NVS-persisted seq counter ---------------- */
 
@@ -259,19 +260,24 @@ static void seq_persist_advance(void)
 static void init_node_id(void)
 {
     /* MAC LSB: stable per board, distinct between boards. Lets us flash
-     * one firmware to N boards and have them auto-differentiate. */
+     * one firmware to N boards and have them auto-differentiate.
+     * Full MAC string is also captured for display and broadcast text. */
     uint8_t mac[6] = {0};
     esp_err_t err = esp_read_mac(mac, ESP_MAC_BASE);
     if (err == ESP_OK) {
         s_node_id = mac[5];
+        snprintf(s_mac_str, sizeof(s_mac_str),
+                 "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     } else {
         s_node_id = 0xA1;
+        snprintf(s_mac_str, sizeof(s_mac_str), "??:??:??:??:??:??");
         ESP_LOGW(TAG, "esp_read_mac failed (%s); fallback ID 0x%02X",
                  esp_err_to_name(err), s_node_id);
     }
     /* Reserve 0xFF for broadcast addressing. */
     if (s_node_id == MESH_BROADCAST) s_node_id = 0xFE;
-    ESP_LOGI(TAG, "node ID: 0x%02X", s_node_id);
+    ESP_LOGI(TAG, "node ID: 0x%02X (MAC: %s)", s_node_id, s_mac_str);
 }
 
 /* ---------------- Channel hash (early filter) ---------------- */
@@ -883,7 +889,8 @@ static void app_task(void *arg)
         /* 3. Periodic broadcast (skipped if our role doesn't originate). */
         if (ROLE_ORIGINATES && (int32_t)(next_tx - now) <= 0) {
             int text_len = snprintf(text, sizeof(text),
-                                    "hello from heltec v3 #%lu", (unsigned long)n);
+                                    "Hello from %s #%lu",
+                                    s_mac_str, (unsigned long)n);
             if (text_len < 0) text_len = 0;
 
             frame[0] = s_channel_hash;
