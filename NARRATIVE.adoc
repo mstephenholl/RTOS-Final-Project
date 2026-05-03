@@ -1,0 +1,742 @@
+= RTOS Final Project: A Narrative
+:author: Michael Holland
+:revdate: 2026-05-03
+:toc: left
+:toclevels: 3
+:sectnums:
+:icons: font
+:source-highlighter: rouge
+
+== Problem Statement
+
+This project follows a **single linear arc** with seven sequential
+stages, each building on the previous one:
+
+. **Hand-roll an SX1262 LoRa driver** for the Heltec WiFi LoRa 32 V3
+  board, working directly from the chip data sheet — no LoRaMac-node,
+  no Semtech reference code, no third-party radio stack.
+. **Integrate the driver with FreeRTOS** — `lora_task` pinned to one
+  core owning the radio state machine, `app_task` on the other core
+  draining an RX event queue, no I²C in the radio hot path.
+. **Harden the driver** — fix the race conditions, IRQ-versus-task
+  context bugs, and missing pieces (CAD-before-TX, frame headers,
+  TX-done callback) that the bring-up code didn't have.
+. **Add mesh networking** — `[src][seq][dst][hop_flags][body]` framing,
+  dedup cache, flood forwarding with TTL, unicast ACK protocol with
+  exponential-backoff retries.
+. **Add power/sleep management** — chip-side sleep primitives,
+  role-based policy (`LEAF` / `ROUTER` / `GATEWAY`), CPU light sleep,
+  RTC-wake deep sleep — in anticipation of testing **multi-node
+  non-local networks** where some nodes will be physically distant
+  from a power source and need long battery life.
+. **Polish the networking** — NVS-persisted sequence numbers (replay
+  safety across reboots), AES-128-CTR body encryption, 1-byte channel
+  hash for cheap early-reject of cross-experiment traffic.
+. **Determine, on the resulting system, *at what loads radio
+  transmission starts to break*.** Two free variables: incoming
+  RX rate, and synthetic CPU contention from a load harness. Find
+  the regime where each radio-path failure mode first shows up.
+
+The first six stages produced an artifact — a portable, encrypted,
+power-aware mesh stack on top of a clean-room LoRa driver. The
+seventh stage is the experiment: pushing that artifact until it
+fails, and characterizing exactly *how* it fails.
+
+The instrumentation harness built for stage seven is what lets us
+distinguish "the radio works" from "the radio almost works" — drop
+counters at every gate, latency tracking at every queue, GPIO toggles
+for logic-analyzer timeline capture.
+
+== Hardware
+
+=== Heltec WiFi LoRa 32 V3 (2 boards)
+
+[cols="1,3", options="header"]
+|===
+| Component | Notes
+
+| MCU
+| Espressif **ESP32-S3FN8** -- dual-core Xtensa LX7 @ 240 MHz, 8 MB
+  embedded flash, 512 KB SRAM, USB-Serial-JTAG built in.
+
+| LoRa modem
+| Semtech **SX1262** on SPI (8 MHz). DIO1 wired to GPIO 14 for
+  RX/TX-done IRQ. NSS=GPIO 8, RESET=GPIO 12, BUSY=GPIO 13.
+
+| Display
+| **SSD1306** 128x64 OLED on I2C (GPIO 17 SDA, 18 SCL, RST 21).
+
+| Antenna
+| 868 MHz wire whip (on EU center-frequency 869.525 MHz to stay clear
+  of 868 MHz duty-cycle channels).
+
+| Power
+| USB-C delivery during development; LiPo header for sleep-mode
+  current measurement.
+|===
+
+The two boards are identical; their distinct mesh node IDs are
+derived deterministically from the eFuse MAC at boot. Either can be
+flashed with any role; pairs we run in practice:
+
+* `ROUTER + LEAF` -- to validate origination + relay
+* `ROUTER + GATEWAY` -- to validate forwarding terminating at an
+  observer
+* `LEAF + LEAF` (no relay) -- as a single-hop sanity check
+
+Stage 7 (load breakdown) is run primarily on a **single board** with
+synthetic RX injection driving the receive path; a two-board
+configuration confirms the conclusions on real airtime.
+
+=== DSLogic Plus + DSView
+
+* **DSLogic Plus** -- 16-channel USB logic analyzer, 400 MHz max
+  sample rate, 256 Mbit hardware sample buffer.
+* **DSView v1.3.2** -- the open-source capture/decode UI from
+  DreamSourceLab. Built from source on Ubuntu 24.04 (the
+  `qt5-default` package referenced in the upstream README is dead;
+  installing `qtbase5-dev qttools5-dev qttools5-dev-tools` is the
+  current equivalent).
+
+The LA is what makes the load-breakdown experiment tractable. UART
+log lines are too coarse to resolve sub-millisecond preemption, and
+adding `ESP_LOGI` calls inside a busy-wait would distort exactly the
+timing we're measuring. GPIO toggles cost ~150 ns and are completely
+passive from the running code's perspective.
+
+== Software Stack
+
+=== Build / framework
+
+* **ESP-IDF 5.5.3** -- Espressif's official C SDK. Provides
+  FreeRTOS-as-kernel (not a separate dependency to install), the
+  `esp_pm` power-management framework, NVS Flash, mbedTLS, and the
+  HAL layer used by our drivers.
+* **FreeRTOS SMP (dual-core)** -- IDF builds FreeRTOS in symmetric
+  multiprocessing mode by default; we pin tasks to specific cores
+  from `app_main`.
+* **PlatformIO** -- wraps `idf.py` with a multi-environment build
+  system. The five role-style environments (`router`, `leaf`,
+  `gateway`, `litesleep`, `deepsleep`) all extend `[env:router]`
+  and add a single `-D` flag to switch behavior. A sixth env,
+  `loadtest`, brings up the radio-load instrumentation harness.
+
+Per-environment `sdkconfig.<env>` files override IDF Kconfig defaults
+where each profile demands different kernel knobs (e.g., `litesleep`
+needs `CONFIG_PM_ENABLE=y` and `CONFIG_FREERTOS_USE_TICKLESS_IDLE=y`).
+
+=== Application code
+
+[cols="2,1,4", options="header"]
+|===
+| Module | LOC | Role
+
+| `components/sx1262/` (driver) | ~1000 | SPI bring-up, register
+  map, FIFO read/write, IRQ handling, CAD, sleep/wake.
+| `components/ssd1306/` (driver) | ~280 | I2C bring-up, framebuffer,
+  text render.
+| `src/main.c` | ~1200 | Mesh layer (routing, dedup, ACK retries,
+  encryption), role policy, sleep variants, app/lora/forward tasks,
+  radio drop counters, synthetic RX injector.
+| `src/instrumentation.{c,h}` | ~470 | Load-characterization harness:
+  synthetic CPU-burn tasks, preemption tracker, GPIO timeline,
+  ring-buffer event log, radio-path counters, 5-second stats reporter.
+|===
+
+Roughly 3,000 lines of project-specific C, with no third-party stack
+beyond what ESP-IDF ships.
+
+=== Cryptography & persistence
+
+* **mbedTLS** (vendored in IDF) -- AES-128-CTR for body encryption.
+  CTR mode means a stream cipher: same primitive does encrypt and
+  decrypt, no padding required.
+* **NVS Flash** -- monotonic TX sequence counter survives reboots
+  (with a "future commit" pattern -- write `current + N` once every
+  `N` TXs, so we amortize flash writes but guarantee replay-safety).
+
+== Experiment Evolution
+
+The seven stages of the arc map onto distinct phases of work,
+captured in the git history.
+
+=== Phase 1 -- Hand-rolled SX1262 driver, FreeRTOS-integrated
+
+Initial commit landed a working but minimal SX1262 driver and an
+SSD1306 driver, both written from scratch against the chip data
+sheets. No HAL abstractions; the driver talks SPI directly through
+ESP-IDF's `spi_master` API. About 600 lines for the LoRa stack
+(modulation config, FIFO, IRQ, CAD); 245 for the OLED. The FreeRTOS
+task split (`lora_task` pinned to APP_CPU, `app_task` pinned to
+PRO_CPU, RX events delivered via queue) was present from the
+first commit -- the architecture treats FreeRTOS as the kernel,
+not as an add-on.
+
+Verification: a single board could TX a frame, RX its own (looped
+via external dummy load) frame, and render the count on the display.
+
+=== Phase 2 -- Driver hardening
+
+A series of focused commits addressed concrete bugs and limitations:
+
+[cols="1,4", options="header"]
+|===
+| Fix | What it solved
+
+| RX-queue decouple
+| OLED writes were happening inside the radio IRQ-callback path. Any
+  I2C delay (~1 ms per row) was preempting subsequent radio events.
+  Solution: IRQ posts a compact event struct to a queue; a separate
+  task drains the queue and updates the display.
+
+| FIFO read-out race
+| Reading the SX1262 RX FIFO while the chip is in a transitional
+  state can return stale or partial bytes. Brief STDBY/RX flip
+  forces a clean read pointer.
+
+| CAD-before-TX
+| Channel-Activity Detection prior to transmit, with randomized
+  back-off on detection. Reduces collisions in a 2-node mesh from
+  routine to rare.
+
+| Frame header
+| 4 bytes: `[src_id][dst_id][hop_flags][seq]`. Hop flags pack TTL
+  (4 bits), wants-ACK, is-ACK, is-forwarded.
+
+| `tx_callback`
+| Driver now signals on-air completion (vs. just "queued") to upper
+  layers, enabling the ACK-timeout accounting and -- later -- the
+  instrumentation harness's TX timeline events.
+|===
+
+=== Phase 3 -- Mesh networking
+
+Two tiers landed in sequence:
+
+. **Routing core.** Destination ID, TTL, dedup cache (32 entries,
+  30 s TTL), flood forwarding with 50-500 ms jitter. Any forwarder
+  that has already seen a `[src][seq]` pair drops the duplicate.
+
+. **ACK protocol.** Unicast destinations get an ACK bit set on TX.
+  The originator queues a pending entry with a 2 s initial timeout;
+  on expiry, retries with exponential back-off (capped at 12 s,
+  max 3 retries). ACK frames are themselves dedup'd through the
+  same cache (ACKs carry the original src/seq).
+
+Result: a robust unicast pipeline with end-to-end retransmission, on
+top of a flood-forwarding broadcast layer, in ~200 lines.
+
+=== Phase 4 -- Power/sleep management for non-local deployments
+
+Power policy is the most architecturally interesting subsystem.
+The motivation is forward-looking: in a real multi-node network, some
+nodes will be on battery, sometimes far from a charging point. The
+codebase needs to express *which energy/responsiveness profile* a
+given node should run as -- without forking the codebase or carrying
+runtime config switches that ship dead code on every device.
+
+Solution: a build-time `app_role_t` enum.
+
+[source,c]
+----
+typedef enum {
+    APP_ROLE_LEAF,    /* sleeps between TX, doesn't forward */
+    APP_ROLE_ROUTER,  /* always-on, forwards */
+    APP_ROLE_GATEWAY, /* always-on observer, doesn't originate */
+} app_role_t;
+
+#define ROLE_LOW_POWER  (APP_ROLE == APP_ROLE_LEAF)
+#define ROLE_FORWARDS   (APP_ROLE != APP_ROLE_LEAF)
+#define ROLE_ORIGINATES (APP_ROLE != APP_ROLE_GATEWAY)
+----
+
+Conditionals like `if (ROLE_FORWARDS) { ... }` evaluate at compile
+time, so the linker garbage-collects the un-taken branches. *The
+leaf binary literally does not contain forwarding code.*
+
+Three sleep tiers stacked atop the role abstraction:
+
+* **Tier 1 -- chip primitives.** `sx1262_sleep()` /
+  `sx1262_wake()` driver entry points. Drops the modem from
+  ~5 mA RX-listening to ~1.5 µA cold sleep, with a ~2 ms wake
+  latency.
+* **Tier 3a -- CPU light sleep** (`env:litesleep`). The
+  `esp_pm` framework auto-light-sleeps when all tasks are blocked.
+  Combined with always-on RX, drops total system current ~10x.
+* **Tier 3b -- Deep sleep** (`env:deepsleep`). `app_main` becomes a
+  one-shot procedure: boot → TX one beacon → brief listen window
+  → chip + MCU deep-sleep. Wakes via RTC timer every 60 s. Average
+  current ~10 µA.
+
+=== Phase 5 -- Networking polish
+
+* **NVS-persisted TX sequence** (future-commit pattern) survives
+  reset; replay-safety even after power loss.
+* **AES-128-CTR body encryption.** Routing header stays plaintext
+  (forwarders need to read it); body is encrypted with a per-frame
+  counter as the CTR-mode IV. Driver and protocol layers untouched.
+* **1-byte channel hash filter.** SHA-prefix of channel name
+  (`"rtos-final-project"`) prepended to every frame; mismatches
+  drop in <2 µs before any further parsing. Cheap rejection of
+  cross-experiment traffic if multiple groups share the air.
+
+=== Phase 6 -- Build environment consolidation
+
+Five named environments now exist in `platformio.ini`, each one a
+3-line entry that extends `env:router`:
+
+[source,ini]
+----
+[env:router]      ; default; always-on relay
+[env:leaf]        ; -DAPP_ROLE=APP_ROLE_LEAF
+[env:gateway]     ; -DAPP_ROLE=APP_ROLE_GATEWAY
+[env:litesleep]   ; -DENABLE_LIGHT_SLEEP=1
+[env:deepsleep]   ; -DENABLE_DEEP_SLEEP=1 -DAPP_ROLE=APP_ROLE_LEAF
+[env:loadtest]    ; -DENABLE_INSTRUMENTATION=1
+----
+
+`pio run -e leaf -t upload` produces an entirely different binary
+from `pio run -e router -t upload` -- different code paths included,
+different kernel features compiled in -- without a single runtime
+flag.
+
+=== Phase 7 -- Load breakdown experiment (current focus)
+
+The destination of the arc. The system is built; the question is:
+**at what (RX rate, CPU load) point does radio transmission start
+to break?**
+
+Two free variables:
+
+* **RX rate.** Driven on a single board by a synthetic injector that
+  posts pre-decrypted `rx_event_t` directly to the app-side queue.
+  No peer required; rate set via a compile-time constant, swept by
+  rebuild + reflash.
+* **CPU load.** Three synthetic CPU-burn tasks at priorities between
+  `app_task` and `lora_task`, with configurable periods and WCETs.
+  Lora task is unaffected by the load (it's at higher priority);
+  app_task is the bottleneck.
+
+Why this priority layout matters:
+
+[source]
+----
+HIGHEST  lora_task (prio 23)  ←── RX IRQ runs here, decrypts, channel-filters,
+                                   enqueues to s_rx_events (depth 4)
+         injector  (prio 6)   ←── synthetic RX rate driver (instrumentation)
+         load_a    (prio 5)   ┐
+         load_b    (prio 4)   │── these can ALL preempt app_task,
+         load_c    (prio 3)   │   but NEVER preempt lora_task or injector
+         app_task  (prio 2)   ┘── drains s_rx_events, runs handle_rx_event,
+                                   originates broadcasts, schedules forwards
+LOWEST   instr_*   (prio 1)
+----
+
+So as CPU load climbs, **lora_task keeps receiving fine** (it preempts
+everything below), but **app_task gets starved** -- and `app_task` is
+responsible for draining the RX queue, scheduling forwards, and
+originating broadcasts. The four ways the radio path can drop:
+
+[cols="1,3", options="header"]
+|===
+| Failure mode | Condition
+
+| `rx_drops_queue_full` | `on_rx_packet` (or injector) calls
+  `xQueueSend` and the depth-4 RX queue is full because `app_task`
+  hasn't drained.
+| `tx_drops_enqueue_fail` | `app_task` calls `sx1262_send` for a
+  broadcast and the driver rejects it (channel busy, prior TX still
+  in progress).
+| `fwd_drops_queue_full` | `forward_schedule` runs but the depth-4
+  forward queue is full because the forward task can't get cycles
+  to drain it.
+| `parse_latency_max_us` | (leading indicator) Time from
+  `xQueueSend` to `xQueueReceive` of an RX event. Grows long
+  before drops appear.
+|===
+
+All four are now wired to atomic counters and printed every 5 s by
+the stats reporter, alongside the load-task deadline-miss stats.
+
+[[findings-section]]
+== Findings
+
+=== Static-priority preemption hierarchy is clean and predictable
+
+At 75% nominal CPU load, after ~20 s of runtime, the load harness
+showed exactly the priority hierarchy theory predicts:
+
+[cols="1,1,1,1,1", options="header"]
+|===
+| Task   | Activations | Misses | Preempts/act | Max preempt
+| load_a | 4016        | 0      | ~0           | 13 µs
+| load_b | 1004        | 0      | ~2           | 1032 µs
+| load_c | 201         | 0      | ~4           | 1682 µs
+|===
+
+`load_a` (highest of the loads) runs essentially undisturbed --
+13 µs is just the FreeRTOS tick handler. `load_b`'s max preemption
+(1032 µs) is almost exactly `load_a`'s WCET — one full `load_a`
+activation displaces it. `load_c`'s max (1682 µs) is the combined
+burst of `load_a` plus part of `load_b`.
+
+This isn't the headline finding of the project (the load breakdown
+data is); it's a confidence check that the instrumentation is reading
+the system correctly before we trust its drop-rate measurements.
+
+=== Wallclock-bounded busy-wait is honest, with caveats
+
+The load tasks busy-wait against `esp_timer_get_time()` rather than
+counting NOPs. This means *under preemption, a load task's effective
+CPU time is less than its configured WCET* -- when the task gets
+preempted, the deadline check exits the spin early.
+
+For a deadline-miss metric ("did the system keep up?") this is fine:
+we're asking whether the work fit in the period, not how much work
+was done. For finer comparisons of scheduler discipline we'd want
+CPU-time-accurate load (calibrated NOP loops); not relevant for the
+current focus on radio-path breakdown.
+
+=== `instr_log` is a pleasingly fast lock-free ring buffer
+
+Atomic-fetch-add on a `uint32_t` head pointer, mod 256 (power of two,
+so it's a single AND), four memory writes, no locks. Total cost
+~330 ns. Producer concurrency is unrestricted -- ISRs and tasks can
+all log without coordination -- because the head increment is
+atomic and timestamps come from `esp_timer_get_time()` directly.
+Slots may interleave by timestamp under concurrent producers, which
+the dumper task resolves at log-emission time by sorting.
+
+=== Headline result: a two-regime breakpoint structure
+
+The single board running `loadtest` exhibits two distinct failure
+modes, separated by whether the SSD1306 OLED is on the path of
+synthetic RX events:
+
+**Regime 1 — OLED-bound (with render).** Each RX event addressed to
+us (broadcast or unicast-to-self) triggers a full framebuffer flush
+over 400 kHz I2C, taking ~39 ms blocking on app_task. When
+inter-arrival time drops below render time
+(`1000 / 39 ≈ 26 Hz`), the depth-4 RX queue can no longer absorb
+the deficit and frames drop sharply.
+
+**Regime 2 — TX-OLED-bound (synthetic events bypass render).** With
+`INJECTOR_BYPASS_OLED=1`, synthetic events skip render. The
+dominant bottleneck shifts to the *broadcast TX* path on this node,
+which also flushes the OLED to update its TX counter. Drop rate
+becomes `(TX events × OLED flush time) / RX rate`, scaling slowly
+and almost insensitive to RX rate.
+
+[cols="1,1,1,1,1", options="header"]
+|===
+| RX rate | OLED render | Drops | avg parse | max parse
+| 10 Hz   | active      | 0%    | 0.3 ms    | 7 ms
+| 25 Hz   | active      | 0%    | 4.5 ms    | 66 ms
+| 26 Hz   | active      | 2.7%  | 133 ms    | 216 ms
+| 27 Hz   | active      | 5.1%  | 133 ms    | 200 ms
+| 28 Hz   | active      | 10.5% | 137 ms    | 194 ms
+| 30 Hz   | active      | 15.2% | 138 ms    | 197 ms
+| 30 Hz   | bypass      | 0%    | 1.4 ms    | 35 ms
+| 100 Hz  | bypass      | 0%    | 1.1 ms    | 34 ms
+| 200 Hz  | bypass      | 0.1%  | 0.7 ms    | 41 ms
+| 500 Hz  | bypass      | 0.4%  | 1.5 ms    | 46 ms
+|===
+
+=== The cliff has a sign-change, the post-cliff curve is linear
+
+The transition from "no drops" to "drops" is not gradual. Between
+**25 Hz (0% drops, 4.5 ms latency)** and **26 Hz (2.7% drops,
+133 ms latency)** the average parse latency jumps **30×** — a
+discontinuity. That tells us the *queue state* changed
+fundamentally: at 25 Hz the queue is mostly empty (events processed
+faster than they arrive), at 26 Hz the queue is mostly full (events
+sit waiting most of their dwell). The drop *rate* understates the
+discontinuity; *latency* is the deeper signal.
+
+Above 26 Hz, the curve is nearly linear. The simplest model
+predicts:
+
+[source]
+----
+drop_rate ≈ (rate − cliff_rate) / rate,    where cliff_rate = 1000 / render_time_ms
+----
+
+For our SSD1306 at 39 ms, `cliff_rate ≈ 25.6 Hz`. Predictions vs.
+observations:
+
+[cols="1,1,1,1", options="header"]
+|===
+| Rate | Predicted | Observed | Discrepancy
+| 26 Hz | 1.5%  | 2.7%  | 1.8× over (cliff edge)
+| 27 Hz | 5.2%  | 5.1%  | match
+| 28 Hz | 8.6%  | 10.5% | 1.2× over (still near cliff)
+| 30 Hz | 14.7% | 15.2% | match
+|===
+
+The model fits cleanly above ~27 Hz. Right at the cliff edge (26
+Hz, 0.5 ms slack), render-time *variance* matters: average render
+is 39 ms but max is 72 ms, and even one 72 ms outlier blows out a
+queue that has only 0.5 ms of slack to absorb it. Far from the edge,
+variance averages out and the linear model wins.
+
+**The shape of the answer:** for any blocking-I/O ceiling C ms in
+this architecture, the radio breaks at rate `1000/C` Hz and drop
+rate climbs linearly above the cliff. That's the closed form.
+
+=== The OLED display is the dominant bottleneck at low RX rates
+
+`render_rx_event` invokes four `ssd1306_printf` formatting calls
+plus one `ssd1306_flush`. The flush pushes the entire 1024-byte
+framebuffer over 400 kHz I2C. Total observed cost:
+**~39 ms blocking on app_task per RX event displayed** (avg 37.7 ms,
+max 55.8 ms in our trace).
+
+ESP-IDF's I2C driver uses interrupt-driven completion with a
+semaphore wait, so during the ~21 ms transfer app_task is
+*suspended* (not busy) and other tasks (load_a/b/c, lora_task,
+injector) run normally on either core. The cost is real but doesn't
+show up in CPU-utilization metrics — it shows up in *latency*,
+specifically in app_task's ability to drain the RX event queue.
+
+Removing OLED render from the path (via `INJECTOR_BYPASS_OLED` for
+synthetic events) is decisive: at 30 Hz, drops go from 15.2% to 0%,
+and the system sustains 500 Hz with only 0.4% drops.
+
+=== Post-bypass: drops are TX-frequency-driven, not RX-rate-driven
+
+In the bypass regime, the drop pattern is striking: at 200 Hz,
+drops appear in *clusters of 4* every ~10 seconds — exactly the
+broadcast TX interval. App_task's *own* TX path also calls
+`ssd1306_printf` and `ssd1306_flush` to update the on-screen TX
+counter, blocking app_task for another ~39 ms. During that block,
+8 events arrive at 200 Hz, queue depth 4 absorbs 4, the other 4
+drop. Per TX event: exactly 4 drops.
+
+The math:
+[source]
+----
+drops_per_window ≈ TX_events_per_window × max(0, RX_rate × OLED_flush − queue_depth)
+----
+
+At 500 Hz this predicts 15-20 drops per 5 s window with a single
+broadcast TX; observed 6-21 (varies with ACK retry storms that add
+more OLED flushes).
+
+The counter-intuitive consequence: in this regime, **higher RX rate
+reduces drop *percentage*** because the denominator grows faster
+than the (mostly fixed) drops/sec. The system isn't RX-bound — it's
+bound by app_task's own blocking I/O.
+
+=== Graceful degradation: load tasks unaffected even at 15% drops
+
+Through every regime tested — including 30 Hz with 15.2% RX drops
+— the synthetic load tasks (`load_a`, `load_b`, `load_c`) showed
+**zero deadline misses**. The radio failure is fully isolated by
+the static priority hierarchy: RX queue overflow at the lowest
+layer doesn't propagate into the rest of the system.
+
+This is exactly what a real-world deployment wants: the radio can
+saturate without causing collateral damage to other subsystems.
+
+== Generalizing the result: OLED as a stand-in for blocking I/O
+
+The OLED in this experiment isn't special. It's a representative
+of an entire class of dependencies. **Any blocking I/O on
+app_task** shows the same structure:
+
+* the call suspends the task on a completion semaphore
+* CPU isn't busy during the transfer; the task is just *waiting*
+* cost is in the 10-50 ms range for typical sensors over I2C/SPI/
+  UART
+
+[cols="3,1,2", options="header"]
+|===
+| Driver path | Cost | Implied ceiling
+| SSD1306 OLED I2C @ 400 kHz *(this experiment)* | ~39 ms | ~26 Hz
+| SHT30 temp/humidity (high-precision)           | ~13 ms | ~77 Hz
+| BME280 temp/humidity/pressure                  | ~10 ms | ~100 Hz
+| DHT22 (1-wire, blocking timing)                | 5-25 ms | 40-200 Hz
+| GPS UART (waiting for fix)                     | 100-300 ms | 3-10 Hz
+|===
+
+The arithmetic — `1000 / blocking_time = max_sustainable_rate` —
+is the universal form. Only the constant changes per device.
+
+=== Two regimes, two real-world patterns
+
+The two failure regimes we measured map directly to two
+deployment patterns:
+
+* **Regime 1 — RX-triggered I/O** maps to *request/response*
+  services: an incoming message asks for a reading, the node
+  reads its sensor, replies. Drop rate is bounded by
+  `1 / sensor_read_time` Hz of incoming requests. Above that
+  ceiling, requests pile up and the RX queue overflows.
+
+* **Regime 2 — TX-preceded I/O** maps to *periodic telemetry*:
+  a scheduled TX is preceded by a fresh sensor read. App_task
+  blocks for the read each cycle, can't drain incoming traffic
+  during that block, and drops anything that arrives faster than
+  queue depth can absorb. Drop rate scales as
+  `(TX_freq × blocking_time) / RX_rate` — counter-intuitively,
+  *higher* incoming RX rate gives a *lower* drop *percentage*
+  because the denominator grows faster than the (mostly fixed)
+  numerator.
+
+The OLED-on-RX-path measurement is regime 1 directly. The OLED-on-
+TX-path measurement (broadcast-TX render at 200-500 Hz) is regime 2
+directly. A real sensor-driven node in either pattern would
+inherit the same shape, with the constant rescaled to the sensor's
+read time.
+
+=== What changes the picture
+
+The blocking-I/O ceiling is a property of the *driver*, not the
+device:
+
+* **DMA-capable drivers.** ESP-IDF I2C/SPI with DMA can run a bus
+  transfer concurrently with task execution. SHT30 over polled
+  I2C: 13 ms task block. SHT30 over a DMA-aware async driver:
+  ~100 µs of CPU work, the bus time is "free." A DMA-capable OLED
+  driver would have eliminated regime 1 entirely. The blocking-
+  I/O ceiling is a *driver implementation detail*, not a hardware
+  fact.
+
+* **Decouple via a sampler task.** Move the sensor read into a
+  dedicated low-priority task with a small ring buffer of latest
+  readings. The radio path reads from the ring buffer (memcpy,
+  microseconds) instead of from the sensor (tens of ms). Sensor
+  cadence is no longer coupled to radio cadence. This is the
+  architectural fix you'd apply to ship this for real — the same
+  trick would turn `render_rx_event` into "post a render request
+  to a queue" with an OLED task draining it.
+
+* **Compound dependencies stack.** If you have *both* a sensor
+  read on the TX path *and* an OLED render on the RX path, the
+  ceiling drops to whichever pattern the deployment exercises
+  most. 39 ms OLED + 13 ms SHT30 per cycle → ~52 ms blocking →
+  ~19 Hz combined ceiling. Costs compose linearly.
+
+The 26 Hz number we measured is OLED-specific. The *form* of the
+answer — that single-task blocking I/O imposes a `1 / blocking_time`
+ceiling on radio throughput — is universal for any non-DMA,
+non-decoupled architecture. **The OLED experiment is, in this
+sense, a worked example of I/O-boundedness for the entire class
+of sensor-coupled radio applications.**
+
+== Where We're Going
+
+The headline question — "at what load does radio transmission
+start to break?" — now has a two-part answer (see <<findings-section>>):
+26 Hz with OLED render, several hundred Hz without. Pending work
+sharpens those numbers and tests their robustness.
+
+=== Pending: orthogonal CPU-load sweep
+
+Hold RX rate constant (e.g., 200 Hz, where we have a measurable
+0.1% drop rate from broadcast-TX OLED), and sweep `load_c`'s WCET
+upward to see how CPU contention shifts the curve. Question: is
+the post-bypass regime sensitive to load, or does the TX-OLED
+bottleneck dominate regardless of CPU pressure?
+
+=== Eventual: confirm with a two-board test
+
+Replace the injector with real radio traffic from a peer board.
+Validates that the single-board conclusions transfer to airtime
+and exposes any failure modes the synthetic path doesn't model
+(SX1262 internal queueing, CAD interactions, RSSI-driven
+sensitivity).
+
+=== Out of scope (for this experiment, but tempting)
+
+* **Move OLED to a lower-priority task** — would eliminate both
+  bottlenecks but requires app-layer redesign.
+* **Variable queue depth** — depth-4 absorbs ~80 ms of starvation
+  at 50 Hz. Studying drop rate vs. queue depth at fixed rate would
+  illuminate the tradeoff between memory and tolerance.
+* **Aperiodic RX bursts** — real airtime is bursty; characterizing
+  the system response to bursts of N events back-to-back would
+  test queue dynamics in a way the steady-state injector can't.
+
+== Reproducibility
+
+[source,bash]
+----
+# Build & flash a node as router (default)
+pio run -t upload -t monitor
+
+# As a leaf (sleeps between TX, no forwarding)
+pio run -e leaf -t upload -t monitor
+
+# As an instrumented load-test rig
+pio run -e loadtest -t upload -t monitor
+----
+
+To configure an experiment run, edit the constants at the top of
+`src/main.c`:
+
+[source,c]
+----
+#define INJECTOR_RATE_HZ      0     /* 0 disables; 5/10/25/50/100 to sweep */
+#define INJECTOR_BODY_LEN     23
+#define INJECTOR_TTL          0
+----
+
+…and the load configuration in `src/instrumentation.c`:
+
+[source,c]
+----
+static load_cfg_t s_load_cfgs[] = {
+    /* name      task_id              gpio              prio period(ms) wcet(us) */
+    { "load_a",  INSTR_TASK_LOAD_A,   INSTR_GPIO_LOAD_A, 5,  5,         1000  },
+    { "load_b",  INSTR_TASK_LOAD_B,   INSTR_GPIO_LOAD_B, 4,  20,        5000  },
+    { "load_c",  INSTR_TASK_LOAD_C,   INSTR_GPIO_LOAD_C, 3,  100,       30000 },
+};
+----
+
+Logic analyzer probe map for the load-test build:
+
+[cols="1,2,3", options="header"]
+|===
+| GPIO | Signal               | Notes
+| 1    | APP_TASK active      | reserved; currently unused
+| 2    | LOAD_A active        | high-priority load
+| 4    | LOAD_B active        | mid-priority load
+| 5    | LOAD_C active        | low-priority load
+| 6    | LORA TX_DONE pulse   | 5 µs HIGH on each on-air completion
+| 7    | LORA RX pulse        | 5 µs HIGH on each received frame
+|===
+
+GPIO 3 is skipped (JTAG strapping pin); GPIOs 8-14, 17-18, 21 are
+internally routed on the V3 PCB and not header-accessible.
+
+== Appendix: Commit Map
+
+[cols="1,3", options="header"]
+|===
+| Commit  | Subject
+
+| 58c96cf | Initial commit: bare-metal SX1262 + SSD1306 driver on Heltec V3
+| 2106816 | Decouple OLED writes from radio hot path via RX-event queue
+| c30f7c8 | Fix RX FIFO read-out race via brief STDBY/RX flip in do_rx_packet
+| 4a546b7 | CAD-before-TX: listen briefly, back off with jitter on detection
+| a8fb0ae | Add simple [src_id][seq] frame header
+| fd73578 | Add tx_callback for on-air TX completion signalling
+| e1ea4c8 | Mesh Tier 1: routing core (dst_id + TTL header, dedup, flood forwarding)
+| cb359ea | Mesh Tier 2: unicast ACK protocol with exponential-backoff retries
+| 65b9de5 | Sleep Tier 1: expose sx1262_sleep() / sx1262_wake() driver primitives
+| 254f901 | Sleep Tier 2: app_role_t enum (LEAF / ROUTER / GATEWAY) bundles policy
+| e906741 | Persist tx_seq in NVS via "future commit" pattern
+| 0f0e83f | AES-128-CTR channel encryption (body-only; routing header plaintext)
+| 26f2cab | Channel-hash filter: 1-byte SHA prefix drops wrong-channel frames early
+| 1f67b61 | Sleep Tier 3a: ESP32 light sleep via PM framework (litesleep build env)
+| 1708b9d | Sleep Tier 3b: deep sleep with RTC-timer wake (deepsleep build env)
+| c7beadf | Rename default env heltec_wifi_lora_32_V3 -> ROUTER
+| d051565 | Lowercase env: ROUTER -> router for naming consistency
+| 43c37c7 | Add scheduler/load-characterization instrumentation harness
+| d534ac3 | Mirror LoRa TX_DONE / RX events to header-accessible GPIOs
+| 5eab9bb | Track and report preemption stats per load task
+| 8179b94 | Wire radio drop counters into RX/TX/forward paths
+| 9079591 | Add synthetic RX event injector for single-board load testing
+| f5ec14e | Track OLED render time and add bypass for synthetic events
+|===

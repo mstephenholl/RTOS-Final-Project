@@ -19,3 +19,6 @@ compile_commands.json
 *.elf
 *.bin
 *.map
+
+# AsciiDoc rendered output (regenerate with `asciidoctor NARRATIVE.adoc`).
+*.html
