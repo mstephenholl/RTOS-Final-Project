@@ -44,8 +44,8 @@ fails, and characterizing exactly *how* it fails.
 
 The instrumentation harness built for stage seven is what lets us
 distinguish "the radio works" from "the radio almost works" — drop
-counters at every gate, latency tracking at every queue, GPIO toggles
-for logic-analyzer timeline capture.
+counters at every gate, latency tracking at every queue, render-time
+measurement around the OLED I/O path.
 
 == Hardware
 
@@ -87,22 +87,6 @@ flashed with any role; pairs we run in practice:
 Stage 7 (load breakdown) is run primarily on a **single board** with
 synthetic RX injection driving the receive path; a two-board
 configuration confirms the conclusions on real airtime.
-
-=== DSLogic Plus + DSView
-
-* **DSLogic Plus** -- 16-channel USB logic analyzer, 400 MHz max
-  sample rate, 256 Mbit hardware sample buffer.
-* **DSView v1.3.2** -- the open-source capture/decode UI from
-  DreamSourceLab. Built from source on Ubuntu 24.04 (the
-  `qt5-default` package referenced in the upstream README is dead;
-  installing `qtbase5-dev qttools5-dev qttools5-dev-tools` is the
-  current equivalent).
-
-The LA is what makes the load-breakdown experiment tractable. UART
-log lines are too coarse to resolve sub-millisecond preemption, and
-adding `ESP_LOGI` calls inside a busy-wait would distort exactly the
-timing we're measuring. GPIO toggles cost ~150 ns and are completely
-passive from the running code's perspective.
 
 == Software Stack
 
@@ -728,22 +712,6 @@ static load_cfg_t s_load_cfgs[] = {
     { "load_c",  INSTR_TASK_LOAD_C,   INSTR_GPIO_LOAD_C, 3,  100,       30000 },
 };
 ----
-
-Logic analyzer probe map for the load-test build:
-
-[cols="1,2,3", options="header"]
-|===
-| GPIO | Signal               | Notes
-| 1    | APP_TASK active      | reserved; currently unused
-| 2    | LOAD_A active        | high-priority load
-| 4    | LOAD_B active        | mid-priority load
-| 5    | LOAD_C active        | low-priority load
-| 6    | LORA TX_DONE pulse   | 5 µs HIGH on each on-air completion
-| 7    | LORA RX pulse        | 5 µs HIGH on each received frame
-|===
-
-GPIO 3 is skipped (JTAG strapping pin); GPIOs 8-14, 17-18, 21 are
-internally routed on the V3 PCB and not header-accessible.
 
 == Appendix: Commit Map
 
