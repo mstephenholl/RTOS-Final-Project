@@ -39,6 +39,8 @@
 #define INSTR_EVT_TX_QUEUED      2
 #define INSTR_EVT_TX_DONE        3
 #define INSTR_EVT_RX             4
+#define INSTR_EVT_PREEMPTION     5     /* logged only for "unusual" gaps; see
+                                        * PREEMPTION_LOG_THRESHOLD_US */
 #define INSTR_EVT_USER           100
 
 /* ---- Task IDs (ring buffer / UART) ---- */

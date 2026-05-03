@@ -89,7 +89,22 @@ typedef struct {
     uint32_t    activations;
     uint32_t    deadline_misses;
     int64_t     max_late_us;
+
+    /* Preemption stats: a "preemption" is a gap > PREEMPTION_THRESHOLD_US
+     * between successive esp_timer_get_time() reads inside the busy-wait —
+     * i.e., wallclock advanced while we weren't running. */
+    uint32_t    preemption_count;
+    int64_t     total_preemption_us;
+    int64_t     max_preemption_us;
 } load_cfg_t;
+
+/* Tuning thresholds for preemption detection. */
+#define PREEMPTION_THRESHOLD_US      10     /* count + accumulate above this */
+#define PREEMPTION_LOG_THRESHOLD_US  10000  /* push to ring buffer above this:
+                                             * only "unusual" preemptions, not
+                                             * routine load_a-preempts-load_b
+                                             * events at ~1 ms. Adjust if the
+                                             * workload's normal max changes. */
 
 static load_cfg_t s_load_cfgs[] = {
     /* name      task_id              gpio              prio period(ms) wcet(us) */
@@ -99,11 +114,32 @@ static load_cfg_t s_load_cfgs[] = {
 };
 #define NUM_LOAD_TASKS  (sizeof(s_load_cfgs) / sizeof(s_load_cfgs[0]))
 
-static void burn_cpu_us(uint32_t us)
+/* Busy-wait for `cfg->wcet_us` of wallclock time, detecting preemption as
+ * we go: any gap > PREEMPTION_THRESHOLD_US between successive timer reads
+ * is wallclock that advanced while another task or ISR ran. Updates the
+ * task's preemption stats; logs individual events to the ring buffer only
+ * when they exceed PREEMPTION_LOG_THRESHOLD_US (avoids buffer overrun). */
+static void burn_cpu_with_preemption_tracking(load_cfg_t *cfg)
 {
-    int64_t target = esp_timer_get_time() + us;
-    while (esp_timer_get_time() < target) {
-        /* tight spin; the volatile in esp_timer_get_time prevents hoisting */
+    int64_t last_us   = esp_timer_get_time();
+    int64_t target_us = last_us + cfg->wcet_us;
+
+    while (last_us < target_us) {
+        int64_t now_us   = esp_timer_get_time();
+        int64_t delta_us = now_us - last_us;
+
+        if (delta_us > PREEMPTION_THRESHOLD_US) {
+            cfg->preemption_count++;
+            cfg->total_preemption_us += delta_us;
+            if (delta_us > cfg->max_preemption_us) {
+                cfg->max_preemption_us = delta_us;
+            }
+            if (delta_us > PREEMPTION_LOG_THRESHOLD_US) {
+                instr_log(INSTR_EVT_PREEMPTION, cfg->task_id,
+                          (uint32_t)delta_us);
+            }
+        }
+        last_us = now_us;
     }
 }
 
@@ -116,7 +152,7 @@ static void load_task_body(void *arg)
 
     for (;;) {
         instr_gpio_set(cfg->instr_gpio, 1);
-        burn_cpu_us(cfg->wcet_us);
+        burn_cpu_with_preemption_tracking(cfg);
         instr_gpio_set(cfg->instr_gpio, 0);
 
         cfg->activations++;
@@ -161,9 +197,17 @@ static void stats_task(void *arg)
         ESP_LOGI(TAG, "---- 5 s stats ----");
         for (size_t i = 0; i < NUM_LOAD_TASKS; i++) {
             load_cfg_t *cfg = &s_load_cfgs[i];
+
             uint32_t miss_x10 = cfg->activations > 0
                 ? (cfg->deadline_misses * 1000U) / cfg->activations
                 : 0;
+            int64_t avg_preempt_us = cfg->preemption_count > 0
+                ? cfg->total_preemption_us / (int64_t)cfg->preemption_count
+                : 0;
+            uint32_t preempt_per_act = cfg->activations > 0
+                ? cfg->preemption_count / cfg->activations
+                : 0;
+
             ESP_LOGI(TAG, "%s: %u acts, %u misses (%u.%u%%), max late=%lldus",
                      cfg->name,
                      (unsigned)cfg->activations,
@@ -171,6 +215,13 @@ static void stats_task(void *arg)
                      (unsigned)(miss_x10 / 10),
                      (unsigned)(miss_x10 % 10),
                      cfg->max_late_us);
+            ESP_LOGI(TAG, "    preempt: %u total (~%u/act), avg %lldus, "
+                     "max %lldus, total %lldus",
+                     (unsigned)cfg->preemption_count,
+                     (unsigned)preempt_per_act,
+                     avg_preempt_us,
+                     cfg->max_preemption_us,
+                     cfg->total_preemption_us);
         }
     }
 }
