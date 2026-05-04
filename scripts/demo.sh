@@ -158,12 +158,18 @@ cat <<'EOF'
   shows: a description of what is being tested, the configuration
   applied, and a filtered ~30 s serial stream from the board.
 
-  Tip: open a second shell window and run
+  Tip: to mirror the controller's output to a second shell window,
+  re-run the demo with output piped to a log file:
 
-      pio device monitor --port /dev/ttyUSB0
+      ./scripts/demo.sh 2>&1 | tee /tmp/demo.log
 
-  to see the full unfiltered output alongside the filtered narration
-  in this window.
+  ...and in a second window:
+
+      tail -F /tmp/demo.log
+
+  Do NOT open `pio device monitor` or `cat $PORT` on the same port
+  while the demo runs — they hold the serial port exclusively and
+  will cause the per-phase flash to fail with `[upload] Error 2`.
 
 EOF
 
