@@ -469,6 +469,83 @@ the stats reporter, alongside the load-task deadline-miss stats.
 [[findings-section]]
 == Findings
 
+[[findings-at-a-glance]]
+=== At a glance
+
+A short layman explanation of each finding, for readers who want
+the gist before the technical detail. Each item maps to one of
+the subsections that follow.
+
+. **The priority system actually works.** High-priority tasks
+  reliably interrupt lower-priority ones in a predictable way.
+  *Why we care:* this is the foundation every other claim rests
+  on; if priority didn't behave like priority, we couldn't reason
+  about anything else.
+
+. **Our timing measurements are honest, with one caveat.** We
+  measured task duration by watching the wall clock during busy
+  work, rather than counting CPU cycles. *Why we care:* this
+  gives a fair "did the system keep up?" answer, but slightly
+  understates raw work done — relevant for anyone repeating the
+  experiment with different scheduling disciplines.
+
+. **The logging mechanism is fast.** Recording an event takes
+  about 330 ns (a single keystroke takes millions of
+  nanoseconds). *Why we care:* if our measurement tool were
+  slow, it would itself become a bottleneck and contaminate the
+  measurements we're trying to make.
+
+. **The radio breaks in two completely different ways.** With
+  the OLED on the receive path, the radio breaks at 26
+  messages/sec. With it bypassed, the system handles 500+
+  messages/sec comfortably. *Why we care:* "at what load does
+  the radio break?" doesn't have a single answer — it depends
+  entirely on what other I/O work the receive path is doing.
+
+. **The breaking point is a cliff, not a slope.** At 25
+  messages/sec the system is fine; at 26 it suddenly drops 2.7%.
+  Above the cliff, loss rate grows in a predictable straight
+  line. *Why we care:* sharp transitions are dangerous in
+  production — a system that's fine today can be 15% lossy
+  tomorrow after a small load increase.
+
+. **The OLED display is the dominant bottleneck.** Updating the
+  small screen takes ~39 ms — far longer than anything else
+  on the path. *Why we care:* the bottleneck isn't the radio,
+  network, CPU, or encryption — it's a slow piece of off-board
+  hardware that no one would suspect. This generalizes to any
+  blocking I/O dependency.
+
+. **Higher RX rates lower the drop *percentage* in the bypass
+  regime.** Once the OLED is out of the receive path, the only
+  remaining bottleneck is the transmit-side OLED render. That
+  cost is constant; faster receive rates dilute it as a
+  percentage. *Why we care:* this flips the usual "don't
+  broadcast too often" advice and shapes how to tune real
+  deployments.
+
+. **Failures don't propagate across subsystems.** Overloading
+  the radio doesn't break CPU tasks. Overloading the CPU doesn't
+  break the radio. *Why we care:* real systems fail in chunks,
+  not all at once. A radio that keeps working when something
+  else misbehaves is much more useful than one that goes silent
+  on any disturbance.
+
+. **The dual-core scheduler absorbs aggregate overload.** The
+  chip has two cores; 115% of "one core's worth" of work
+  distributes across both with no missed deadlines. The system
+  only breaks when a single task individually exceeds its own
+  time budget. *Why we care:* the worry "what if total CPU
+  demand exceeds capacity?" is the wrong question on multi-core
+  systems — ask instead "does any individual task ask too much?"
+
+. **Real-radio measurements match synthetic ones.** The OLED
+  render time measured under controlled synthetic injection
+  (37-39 ms) matches what we measured with two boards exchanging
+  real airtime (35-39 ms). *Why we care:* without this
+  validation, all the other findings would be tentative; with
+  it, they transfer from bench to deployment.
+
 === Static-priority preemption hierarchy is clean and predictable
 
 At 75% nominal CPU load, after ~20 s of runtime, the load harness
