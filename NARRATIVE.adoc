@@ -698,6 +698,106 @@ non-decoupled architecture. **The OLED experiment is, in this
 sense, a worked example of I/O-boundedness for the entire class
 of sensor-coupled radio applications.**
 
+== Limitations
+
+The findings above hold within the conditions tested. Several
+classes of question were out of scope, by deliberate methodology
+choice (synthetic injection bypasses certain costs) or by hardware
+and time constraints (no third board for multi-hop, no power
+meter, short experiments). This section enumerates them so the
+scope of the claims is unambiguous.
+
+=== Modulation and airtime
+
+* **Single LoRa profile**: SF7 BW125 CR4/5 throughout. SF12 has
+  ~25× longer airtime per frame; the cliff position relative to
+  the airtime ceiling, and the AES-decrypt-vs-airtime ratio,
+  would shift.
+* **Single TX power and frequency**: 14 dBm at 915 MHz. No
+  co-channel interference characterization.
+* **Frame size narrow**: 32-41 byte plaintext. Larger payloads
+  scale memcpy, AES, and forward-frame storage but not OLED
+  render. The relative weight of the OLED bottleneck shifts with
+  frame size in ways the rate sweep didn't probe.
+
+=== Mesh scale and topology
+
+* **Two-node single-hop only.** TTL=4 is configured but
+  forwarders hear originators directly, so multi-hop relay
+  behavior was never exercised.
+* **Forward queue never overflowed** (`fwd_drop=0` in every
+  experiment). Synthetic injection used TTL=0; real traffic was
+  too sparse. We have no characterization of forward congestion
+  under multi-hop topologies.
+* **Dedup cache never stressed**: 32 entries × 30 s TTL is fine
+  for two nodes. With 10+ nodes broadcasting at meaningful rate,
+  the dedup table would evict legitimate entries and frames
+  could re-loop.
+* **No flow control / backpressure**: the protocol has no
+  mechanism for a receiver to signal a sender to slow down.
+  Real meshes generally need this.
+
+=== Workload model
+
+* **Static periodic load only**: load_a/b/c had fixed periods
+  and WCETs. Real applications have aperiodic, bursty work
+  (event-driven sensor reads, network handlers, interrupt
+  clumps). The same average CPU demand with different
+  distribution may break differently.
+* **Synthetic injector bypasses AES decrypt**: it posts
+  pre-decrypted `rx_event_t` directly to the queue. The
+  post-bypass numbers (200/500 Hz at <0.5% drops) are
+  *optimistic* by the AES-decrypt cost. At 30-byte bodies that
+  is ~200 µs/frame, or ~10% CPU at 500 Hz — significant but not
+  regime-changing.
+* **OLED is the only blocking-I/O source measured**: NVS writes
+  (every 32 TXs in `seq_persist_advance`), bursty UART output,
+  filesystem operations could be other I/O sources unmeasured by
+  this experiment.
+
+=== Operating conditions
+
+* **No RF propagation effects**: bench-only, ~30 cm separation,
+  no multipath, no fading, no RSSI-margin loss. RF-driven drops
+  would compound with the queue-driven drops we measured.
+* **No interference present**: lab environment with no other
+  LoRa or cross-band noise sources.
+* **Bench temperature only**: no thermal extremes; crystal drift
+  and RF-front-end sensitivity variation across temperature were
+  not observed.
+
+=== Power and energy
+
+* **Sleep-mode current draw not quantified**: the `litesleep`
+  and `deepsleep` envs exist but actual µA/mA under each, and
+  how the PM framework interacts with load contention, were not
+  measured.
+* **No battery-life projection**: despite the project's stated
+  motivation of multi-node non-local networks needing low power,
+  the load-vs-energy tradeoff wasn't studied.
+
+=== Time-domain robustness
+
+* **Short experiments**: longest single run was ~3 minutes. NVS
+  wear, dedup churn over hours, slow memory leaks, watchdog
+  edge cases — all unobserved.
+* **Single firmware variant under contention**: only `loadtest`
+  was driven hard. Behavior of `leaf` / `gateway` / `litesleep` /
+  `deepsleep` under similar load is uncharacterized.
+
+=== Generalization
+
+* **Findings are dual-core SMP-specific**: the failure-isolation
+  property (radio survives load_c saturation) leans heavily on
+  ESP32-S3 SMP + core pinning. On single-core MCUs (RP2040,
+  many STM32 variants), the same code would degrade radically
+  differently — there is no second core to absorb load
+  contention.
+* **No alternative scheduling disciplines tested**: the project
+  briefly considered EDF / LLF and dropped that direction. We
+  do not know whether static-priority + SMP is *optimal* for
+  this workload, only that it is *adequate*.
+
 == Where We're Going
 
 The headline question — "at what load does radio transmission
