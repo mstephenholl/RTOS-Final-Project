@@ -92,22 +92,45 @@ configuration confirms the conclusions on real airtime.
 
 === Build / framework
 
-* **ESP-IDF 5.5.3** -- Espressif's official C SDK. Provides
-  FreeRTOS-as-kernel (not a separate dependency to install), the
-  `esp_pm` power-management framework, NVS Flash, mbedTLS, and the
-  HAL layer used by our drivers.
-* **FreeRTOS SMP (dual-core)** -- IDF builds FreeRTOS in symmetric
-  multiprocessing mode by default; we pin tasks to specific cores
-  from `app_main`.
-* **PlatformIO** -- wraps `idf.py` with a multi-environment build
-  system. The five role-style environments (`router`, `leaf`,
-  `gateway`, `litesleep`, `deepsleep`) all extend `[env:router]`
-  and add a single `-D` flag to switch behavior. A sixth env,
-  `loadtest`, brings up the radio-load instrumentation harness.
+* **ESP-IDF 5.5.3** -- Espressif's official C SDK for ESP32-family
+  chips, distributed as a unified framework that vendors FreeRTOS
+  as the kernel, mbedTLS for cryptography, NVS Flash for
+  persistence, and HAL layers for SPI / I2C / GPIO / timers / DMA.
+  We use IDF directly (not the Arduino-ESP32 wrapper) because the
+  experiment needs precise control over task pinning, kernel
+  config, and driver bus access — things Arduino abstracts away.
+  Every driver, task, and persistence path in the project goes
+  through IDF.
 
-Per-environment `sdkconfig.<env>` files override IDF Kconfig defaults
-where each profile demands different kernel knobs (e.g., `litesleep`
-needs `CONFIG_PM_ENABLE=y` and `CONFIG_FREERTOS_USE_TICKLESS_IDLE=y`).
+* **FreeRTOS SMP** -- the real-time kernel running on the chip,
+  vendored inside ESP-IDF. Owns scheduling, task creation, queues
+  (used between the radio IRQ and the app-side parser), semaphores
+  (used by I2C / SPI drivers as blocking-on-completion primitives),
+  and tick management. The "SMP" qualifier means the scheduler can
+  run two ready tasks simultaneously, one per core. This dual-core
+  behavior is load-bearing for the failure-isolation finding — on
+  a single-core kernel, `load_c` saturating would cascade directly
+  into radio degradation rather than staying contained.
+
+* **PlatformIO** -- a higher-level build tool wrapping ESP-IDF's
+  native `idf.py` workflow. Provides multi-environment builds,
+  dependency management, board definitions, and serial-monitor
+  integration. The project's six environments (`router` / `leaf` /
+  `gateway` / `litesleep` / `deepsleep` / `loadtest`) are
+  PlatformIO `[env:...]` blocks that each extend a base env and
+  add one or two `-D` flags, producing six distinct binaries from
+  one source tree without any runtime configuration logic.
+
+* **Per-environment `sdkconfig.<env>` files** -- ESP-IDF uses
+  Kconfig (Linux-kernel-style configuration) for compile-time
+  kernel and driver options. `sdkconfig.defaults` holds the
+  project baseline (FreeRTOS tick rate at 1 kHz, console speed,
+  flash layout); each env layers overrides on top. For example,
+  `litesleep` enables `CONFIG_PM_ENABLE=y` and
+  `CONFIG_FREERTOS_USE_TICKLESS_IDLE=y` to let the kernel
+  auto-light-sleep when idle; the always-on builds omit these to
+  avoid the small overhead these features introduce when not
+  needed.
 
 === Application code
 
