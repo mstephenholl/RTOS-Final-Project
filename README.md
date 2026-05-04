@@ -145,17 +145,39 @@ The demo edits `src/main.c` and `src/instrumentation.c` in place
 between phases and restores them on exit (including on Ctrl+C). The
 working tree must be clean before the demo runs.
 
-## Two-board test
+## Two-board demos
 
-For the airtime confirmation experiment, flash both boards with the
-same firmware:
+Flash both boards with the same firmware:
 
 ```bash
 pio run -e loadtest -t upload --upload-port /dev/ttyUSB0
 pio run -e loadtest -t upload --upload-port /dev/ttyUSB1
 ```
 
-Then open two shell windows:
+### Mesh networking demo
+
+`scripts/mesh-demo.sh` captures both boards' serial output, tags
+each line by source board ([A] / [B]) with a relative timestamp,
+and filters to the mesh-protocol events. Demonstrates broadcasts,
+mesh forwarding with TTL, dedup loopback catching, unicast +
+single-send ACK, and (with manual interaction) ACK retries
+under loss and NVS-persisted sequence numbers across a reboot.
+
+```bash
+./scripts/mesh-demo.sh                   # default 90 s capture
+DURATION=180 ./scripts/mesh-demo.sh      # 3 min
+PORT_A=/dev/ttyUSB1 PORT_B=/dev/ttyUSB0 ./scripts/mesh-demo.sh
+```
+
+While the demo is running, you can:
+- press the **RST button** on either board to see the boot banner
+  and the `restored s_tx_seq=N from NVS` line (NVS persistence proof);
+- briefly **unplug one board** to see the other's ACK retries fire
+  with exponential back-off (2 s → 4 s → 8 s → timeout).
+
+### Manual airtime confirmation
+
+For deeper inspection, open two shell windows:
 
 ```bash
 # Window A
@@ -165,9 +187,10 @@ pio device monitor --port /dev/ttyUSB0
 pio device monitor --port /dev/ttyUSB1
 ```
 
-Each board should hear the other's broadcasts, render OLED for them
-(~37-39 ms per render — the validation data point), and exchange ACKs
-end-to-end.
+Each board should hear the other's broadcasts, render the OLED for
+them (~37-39 ms per render — the validation data point that anchors
+the synthetic-vs-real comparison in `NARRATIVE.adoc`), and exchange
+ACKs end-to-end.
 
 ## Project layout
 
@@ -182,7 +205,8 @@ sdkconfig.defaults          ESP-IDF Kconfig baseline
 sdkconfig.<env>             per-env overrides
 platformio.ini              six build envs
 scripts/
-  demo.sh                   live-demo controller
+  demo.sh                   single-board load-test demo controller
+  mesh-demo.sh              two-board mesh networking demo
 NARRATIVE.adoc              project narrative + experimental findings
 README.md                   this file
 ```
