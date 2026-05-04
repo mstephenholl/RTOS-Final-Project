@@ -47,6 +47,107 @@ distinguish "the radio works" from "the radio almost works" — drop
 counters at every gate, latency tracking at every queue, render-time
 measurement around the OLED I/O path.
 
+== Background
+
+This section briefly explains the recurring concepts in the rest
+of the document. Readers familiar with embedded radio and RTOS
+work can skim or skip; pointers to deeper coverage of each topic
+appear in <<references>>.
+
+=== LoRa
+
+**LoRa** ("Long Range") is a chirp-spread-spectrum radio modulation
+designed by Semtech, used in unlicensed sub-GHz ISM bands —
+**915 MHz** in the US (the band this project uses), 868 MHz in the
+EU, 433 MHz in some other regions. It trades data rate for range:
+typical raw rates are 0.3 - 50 kbps; line-of-sight ranges are
+1 - 15 km. We run **SF7 BW125 CR4/5** (the fastest profile),
+yielding ~5.5 kbps and ~62 ms airtime for a 32-byte frame. The
+~14 Hz practical airtime ceiling at this profile is well below the
+26 Hz "OLED cliff" we identified in software, which is why the
+experiment used a synthetic injector to push past airtime limits.
+
+Tunable LoRa parameters that show up in the codebase:
+
+* **Spreading factor (SF)** -- 7 to 12. Higher SF = longer symbol
+  time = longer airtime per byte, but better receiver sensitivity.
+* **Bandwidth (BW)** -- 125 / 250 / 500 kHz. Wider = faster but
+  shorter range.
+* **Coding rate (CR)** -- forward-error-correction overhead, e.g.,
+  CR4/5 means 4 data bits per 5 transmitted.
+
+=== TX vs RX (and half-duplex)
+
+The radio can either **transmit (TX)** or **receive (RX)** at any
+moment, never both. This is *half-duplex* operation. Implications:
+
+* When a node is TX-ing, it cannot RX — it's deaf during its own
+  transmission.
+* TX completion is signalled by an interrupt (DIO1 on the SX1262);
+  the driver returns to RX after.
+* Two nodes that try to TX simultaneously collide on air and
+  neither succeeds.
+
+To minimize collisions we use **Channel Activity Detection (CAD)**:
+sniff briefly for ongoing transmissions before TX-ing, with random
+back-off if the channel is busy. CAD is LoRa's analog of CSMA in
+wired networks.
+
+=== Mesh networking
+
+A **mesh** topology has each node forward frames on behalf of
+others, extending reach beyond any one node's direct radio range
+(contrast: a *star* topology where every node talks to a hub).
+
+Our mesh uses a **flooding** strategy with a **time-to-live (TTL)**
+field: each forwarder decrements TTL and rebroadcasts unless TTL
+hits 0. A **dedup cache** keyed on `(src_id, seq)` stops the same
+frame from being re-forwarded by the same node, preventing loops.
+This style is sometimes called "Meshtastic-style flooding" — simple
+and robust, doesn't require a routing table, but rebroadcasts
+every frame at every hop so it doesn't scale to large networks
+without modification.
+
+=== ACK protocol
+
+For unicast (single-recipient) messages where reliability matters,
+the sender sets a **wants-ACK (WACK)** bit on the frame. The
+recipient sends back an **acknowledgement (ACK)** frame carrying
+the original sequence number. The sender retries with exponential
+back-off (2 s → 4 s → 8 s, capped at 12 s, max 3 retries) if no
+ACK arrives. Broadcasts never set WACK — every receiver replying
+would create an ACK storm.
+
+=== Real-time scheduling concepts
+
+* **Task** -- an independently-scheduled unit of execution with
+  its own stack and priority. (Synonym: thread.)
+* **Static-priority preemptive scheduling** -- each task has a
+  fixed numerical priority; the highest-priority ready task always
+  runs. FreeRTOS uses higher-number = higher-priority.
+* **WCET (Worst-Case Execution Time)** -- the longest time one
+  invocation of a task can take to do its work. Used in
+  schedulability analysis.
+* **Period** and **deadline** -- a periodic task fires every
+  *period* and is expected to finish before its *deadline*
+  (typically the next period start). "Deadline miss" = task didn't
+  finish in time.
+* **SMP scheduling** -- with N cores, the scheduler can run the N
+  highest-priority ready tasks simultaneously. Increases effective
+  CPU capacity but introduces complications (cache locality,
+  migration cost) absent from single-core schedulers.
+
+=== Blocking I/O
+
+A **blocking I/O call** suspends the calling task while the I/O
+hardware completes. The CPU is *not busy* during the block —
+other tasks run normally — but the calling task can't make
+progress until the I/O finishes and the driver wakes it.
+`ssd1306_flush()` (I2C transfer, ~21 ms wire time + overhead =
+~39 ms total) is the dominant blocking call in this project, and
+understanding it as such is the entry point to the OLED-bottleneck
+finding.
+
 == Hardware
 
 === Heltec WiFi LoRa 32 V3 (2 boards)
@@ -67,8 +168,8 @@ measurement around the OLED I/O path.
 | **SSD1306** 128x64 OLED on I2C (GPIO 17 SDA, 18 SCL, RST 21).
 
 | Antenna
-| 868 MHz wire whip (on EU center-frequency 869.525 MHz to stay clear
-  of 868 MHz duty-cycle channels).
+| 915 MHz wire whip, matched to the US 902-928 MHz ISM band where
+  the radio is configured (`SX1262_FREQ = 915 MHz` in the driver).
 
 | Power
 | USB-C delivery during development; LiPo header for sleep-mode
@@ -878,6 +979,47 @@ static load_cfg_t s_load_cfgs[] = {
     { "load_c",  INSTR_TASK_LOAD_C,   INSTR_GPIO_LOAD_C, 3,  100,       30000 },
 };
 ----
+
+[[references]]
+== References
+
+For deeper coverage of the concepts touched on in the
+<<_background,Background>> and elsewhere:
+
+[cols="2,3", options="header"]
+|===
+| Topic | Resource
+
+| LoRa modulation overview
+| https://en.wikipedia.org/wiki/LoRa
+
+| Semtech LoRa product family + datasheets
+| https://www.semtech.com/lora
+
+| The Things Network — LoRaWAN community resources
+| https://www.thethingsnetwork.org/
+
+| Mesh networking concepts (general)
+| https://en.wikipedia.org/wiki/Mesh_networking
+
+| Meshtastic — open-source LoRa mesh implementation
+| https://meshtastic.org/
+
+| Real-time operating systems (general)
+| https://en.wikipedia.org/wiki/Real-time_operating_system
+
+| FreeRTOS — kernel used in this project
+| https://www.freertos.org/
+
+| ESP-IDF documentation (ESP32-S3)
+| https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/
+
+| Heltec WiFi LoRa 32 V3 — board reference
+| https://heltec.org/project/wifi-lora-32-v3/
+
+| AES-128-CTR — block cipher mode used for body encryption
+| https://en.wikipedia.org/wiki/Block_cipher_mode_of_operation#Counter_(CTR)
+|===
 
 == Appendix: Commit Map
 
