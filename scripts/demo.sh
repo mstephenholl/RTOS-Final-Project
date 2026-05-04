@@ -76,7 +76,8 @@ cleanup() {
     set_bypass 1
     set_load_c 30000
     echo "    Re-flashing board with default config (silent)..."
-    pio run -e "$ENV" -t upload --silent > /dev/null 2>&1 || true
+    pio run -e "$ENV" -t upload --upload-port "$PORT" --silent \
+        > /dev/null 2>&1 || true
     echo "    Done. Working tree is back to its committed state."
 }
 trap cleanup EXIT INT TERM
@@ -107,7 +108,12 @@ EOF
     DEMO_STARTED=1
 
     echo "  Building & flashing..."
-    if ! pio run -e "$ENV" -t upload --silent >/tmp/demo-flash.log 2>&1; then
+    # Pin the upload port to the same one we'll cat from. Without this,
+    # pio auto-detects (alphabetic order) and may flash the wrong board
+    # when two are connected — cat would then read stale output from
+    # the unflashed peer.
+    if ! pio run -e "$ENV" -t upload --upload-port "$PORT" --silent \
+            >/tmp/demo-flash.log 2>&1; then
         echo "  ERROR: build/flash failed; see /tmp/demo-flash.log" >&2
         cat /tmp/demo-flash.log >&2
         return 1
@@ -115,9 +121,15 @@ EOF
 
     echo "  Streaming serial for ${watch} s..."
     echo "  ─────────────────────────────────────────────────────────"
-    # Stream pio device monitor for `watch` seconds, filter for the
-    # interesting lines, drop the high-frequency timeline-ring dumps.
-    timeout "${watch}s" pio device monitor --port "$PORT" 2>/dev/null \
+    # Stream serial for `watch` seconds, filter for the interesting
+    # lines, drop the high-frequency timeline-ring dumps.
+    #
+    # NOTE: we use raw `cat $PORT` rather than `pio device monitor`
+    # because the latter crashes with a Python traceback when stdout
+    # is piped (it refuses to run without a TTY). `stty` configures
+    # the port to 115200 8N1 raw mode beforehand.
+    stty -F "$PORT" 115200 cs8 -cstopb -parenb raw -echo 2>/dev/null || true
+    timeout "${watch}s" cat "$PORT" 2>/dev/null \
         | awk '
             /ts=[0-9]+ evt=/ { next }
             /instr:.*(stats|load_[abc]:|radio:|parse|render|misses)/ { print; fflush(); next }
