@@ -111,19 +111,24 @@ START=$(date +%s)
 #   2. `sed -u` line-tags each board's stream with [A] or [B] and forces
 #      line-buffered output (no awaiting block-buffer fill).
 #   3. The outer subshell merges both tagged streams.
-#   4. `awk` filters to mesh-protocol events and prefixes a [t+SSS]
-#      relative timestamp.
+#   4. `grep --line-buffered` filters to mesh-protocol events.
+#   5. `while read` loop computes a fresh per-line timestamp.
+#
+# We use a bash `while read` loop rather than awk for the timestamp
+# step because awk's stdin is stdio block-buffered when reading from
+# a pipe — even with sed -u upstream and fflush() in awk, all events
+# get the same systime() because they're processed in one burst at
+# upstream EOF. Bash `read -r` is line-buffered and gets a fresh
+# timestamp per line.
 (
     timeout "${DURATION}s" cat "$PORT_A" 2>/dev/null | sed -u 's/^/[A] /' &
     timeout "${DURATION}s" cat "$PORT_B" 2>/dev/null | sed -u 's/^/[B] /' &
     wait
-) | awk -v START="$START" '
-    /node ID|TX bcast|RX #|fwd scheduled|fwd TX queued|dedup drop|ACK TX|ACK received|ACK retry|ACK timeout|TX unicast|seq batch|restored s_tx_seq/ {
-        elapsed = systime() - START
-        printf "[t+%03d] %s\n", elapsed, $0
-        fflush()
-    }
-'
+) | grep --line-buffered -E \
+        'node ID|TX bcast|RX #|fwd scheduled|fwd TX queued|dedup drop|ACK TX|ACK received|ACK retry|ACK timeout|TX unicast|seq batch|restored s_tx_seq' \
+  | while IFS= read -r line; do
+        printf '[t+%03d] %s\n' "$(( $(date +%s) - START ))" "$line"
+    done
 
 # ─── Footer ──────────────────────────────────────────────────────────────
 cat <<'EOF'
